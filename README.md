@@ -13,10 +13,6 @@
 
 前往 [Releases](https://github.com/Weirenshanxia/DVPL-Mod-Helper/releases) 下载最新 APK（Android 8.0+ / arm64 设备，无需任何权限）。
 
-## 截图
-
-待补充。
-
 ## 功能特性
 
 ### 📦 DVPL 编解码
