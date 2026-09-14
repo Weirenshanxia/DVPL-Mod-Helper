@@ -9,6 +9,16 @@
 
 在手机上完成 DVPL 解包/打包、ASTC 纹理与 PNG 互转、PC ↔ 安卓贴图跨端移植——无需电脑。
 
+## 为什么用它？
+
+做 Blitz 的 mod 一直有个痛点：贴图和资源文件被 DVPL 压缩包裹，想在手机上直接改皮肤、
+改图标，就得找电脑跑 Python 脚本。这个 app 把整个流程搬到了手机上：
+
+- 📱 **纯手机工作流**——解包、转 PNG、改图、转回、打包，全程不用电脑
+- 🔧 **格式覆盖全**——WoT 安卓端的 ASTC PVR（含游戏私有的非标准枚举）+ PC 端 DX11 RGBA4444 + DDS 全 BC 家族
+- ⚡ **GPU 直显预览**——ASTC 压缩数据不经软解直接进 GPU，秒开任意贴图
+- 🚀 **轻量**——约 3 MB，无需任何权限，装完即用
+
 ## 下载
 
 前往 [Releases](https://github.com/Weirenshanxia/DVPL-Mod-Helper/releases) 下载最新 APK（Android 8.0+ / arm64 设备，无需任何权限）。
