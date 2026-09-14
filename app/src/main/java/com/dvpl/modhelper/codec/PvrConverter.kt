@@ -74,11 +74,21 @@ object PvrConverter {
     }
 
     /**
-     * Bitmap → PVR 文件字节（ASTC 或 RGBA8888，含 mip 链）
+     * Bitmap → PVR 文件字节（ASTC 或 RGBA8888/4444，含 mip 链）
+     *
+     * 内存策略（4096x4096 防闪退，Java 堆上限 256MB）:
+     *  - 输出精确预分配（头+meta+全部 mip），全程只做一次 toByteArray 复制
+     *  - 未压缩路径逐行 getPixels 流式写入（无整图像素缓冲，行缓冲仅 16KB）
+     *  - ASTC 路径保留整图 IntArray（JNI 需要），但输出体积小（~10MB）
      */
     fun encodeToPvr(bitmap: Bitmap, quality: AstcQuality): ByteArray {
         val w = bitmap.width
         val h = bitmap.height
+
+        // 大图防线：超过 4096x4096 直接拒绝（游戏也不支持，避免 OOM 闪退）
+        if (w > 4096 || h > 4096) {
+            throw IllegalArgumentException("图片 ${w}x${h} 过大（上限 4096x4096），请先缩小")
+        }
 
         // 计算 mip 级数（到 1x1）
         var mips = 1
@@ -93,74 +103,33 @@ object PvrConverter {
         val bh = if (isAstc) quality.blockH else 0
         val is4444 = quality == AstcQuality.RGBA_4444_PC
 
-        // 生成每一级 mip 的位图并压缩
-        val out = java.io.ByteArrayOutputStream()
-        var curW = w; var curH = h;
-        var curBitmap = bitmap;
-        var isFirst = true;
-        
+        // 精确总容量：头(52) + meta + 全部 mip 纹理字节，一次分配避免扩容翻倍
+        val metaSize = if (is4444) 31 else 16
+        var exactTotal = 0L
+        var ew = w; var eh = h
         repeat(mips) {
-            val pixels = IntArray(curW * curH)
-            curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
-            
-            if (is4444) {
-                // RGBA4444（PC DX11 PVR）：ARGB int → [R<<4|G, B<<4|A] 字节对
-                val px = ByteArray(curW * curH * 2)
-                for (i in pixels.indices) {
-                    val p = pixels[i]
-                    val r4 = ((p shr 16) and 0xF0) shr 4
-                    val g4 = (p shr 12) and 0xF
-                    val b4 = (p shr 4) and 0xF
-                    val a4 = p shr 28
-                    px[i*2] = ((r4 shl 4) or g4).toByte()
-                    px[i*2+1] = ((b4 shl 4) or a4).toByte()
-                }
-                out.write(px)
-            } else if (isAstc) {
-                val compressed = nativeAstcEncode(pixels, curW, curH, bw, bh, 0)
-                    ?: throw IllegalStateException("ASTC 编码失败（${curW}x${curH}）")
-                out.write(compressed)
-            } else {
-                // RGBA8888: ARGB int → RGBA 字节
-                val rgba = ByteArray(curW * curH * 4)
-                for (i in pixels.indices) {
-                    val p = pixels[i]
-                    rgba[i*4] = ((p shr 16) and 0xFF).toByte()
-                    rgba[i*4+1] = ((p shr 8) and 0xFF).toByte()
-                    rgba[i*4+2] = (p and 0xFF).toByte()
-                    rgba[i*4+3] = ((p shr 24) and 0xFF).toByte()
-                }
-                out.write(rgba)
+            exactTotal += when {
+                is4444 -> ew.toLong() * eh * 2
+                isAstc -> ((ew + bw - 1) / bw).toLong() * ((eh + bh - 1) / bh) * 16
+                else -> ew.toLong() * eh * 4
             }
-            
-            // 下一级 mip
-            if (it < mips - 1) {
-                val nextW = maxOf(1, (curW + 1) / 2)
-                val nextH = maxOf(1, (curH + 1) / 2)
-                val scaled = Bitmap.createScaledBitmap(curBitmap, nextW, nextH, true)
-                if (!isFirst) curBitmap.recycle()
-                curBitmap = scaled
-                isFirst = false;
-                curW = nextW; curH = nextH;
-            }
+            ew = maxOf(1, (ew + 1) / 2); eh = maxOf(1, (eh + 1) / 2)
         }
-        if (!isFirst) curBitmap.recycle()
+        val out = java.io.ByteArrayOutputStream((52 + metaSize + exactTotal).toInt())
 
-        // 写 PVR v3 头（52 字节）+ 16 字节 CRC metadata
-        val textureData = out.toByteArray()
+        // ---- 52 字节 PVR v3 头（meta 先占位，纹理算完 CRC 后回填）----
         val header = java.nio.ByteBuffer.allocate(52).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         header.putInt(0x03525650)   // version "PVR\x03"
         header.putInt(0)            // flags
         if (isAstc) {
-            val pfEnum = astcBlockToEnum(bw, bh)
-            header.putInt(pfEnum)   // pixelFormat 低32
+            header.putInt(astcBlockToEnum(bw, bh))  // pixelFormat 低32（WoT 非标枚举）
             header.putInt(0)        // 高32 = 0
         } else if (is4444) {
             // PC DX11 PVR：pfLo="rgba"、pfHi=[4,4,4,4]（实测游戏文件确认）
             header.putInt(0x61626772)
             header.putInt(0x04040404)
         } else {
-            // RGBA8888: 低32 = "rgba" 0x61626772, 高32 = [1,1,1,1] 每通道1字节
+            // RGBA8888: 低32 = "rgba"，高32 = [1,1,1,1] 每通道1字节
             header.putInt(0x61626772)
             header.putInt(0x01010101)
         }
@@ -172,40 +141,101 @@ object PvrConverter {
         header.putInt(1)            // numSurfaces
         header.putInt(1)            // numFaces
         header.putInt(mips)         // mipMapCount
-        val metaSize = if (is4444) 31 else 16
         header.putInt(metaSize)     // metaDataSize
-        
+        out.write(header.array())
+        out.write(ByteArray(metaSize))  // meta 占位（结束后回填）
+
+        // ---- 逐级 mip 写纹理数据，同时累计 CRC ----
         val crc = java.util.zip.CRC32()
-        crc.update(textureData)
+        val maxPixels = if (isAstc) IntArray(w * h) else null  // ASTC：JNI 需要整图
+        val rowInts = if (!isAstc) IntArray(w) else null        // 未压缩：逐行流式（行宽最大 = w）
+        var curW = w; var curH = h
+        var curBitmap = bitmap
+        var isFirst = true
+        repeat(mips) {
+            if (isAstc) {
+                val pixels = maxPixels!!
+                curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
+                val compressed = nativeAstcEncode(pixels, curW, curH, bw, bh, 0)
+                    ?: throw IllegalStateException("ASTC 编码失败（${curW}x${curH}）")
+                crc.update(compressed)
+                out.write(compressed)
+            } else if (is4444) {
+                // RGBA4444（PC DX11 PVR）：ARGB int → [R<<4|G, B<<4|A] 字节对，逐行流式
+                val row = ByteArray(curW * 2)
+                val rows = rowInts!!
+                for (y in 0 until curH) {
+                    curBitmap.getPixels(rows, 0, curW, 0, y, curW, 1)
+                    for (x in 0 until curW) {
+                        val p = rows[x]
+                        val r4 = ((p shr 16) and 0xF0) shr 4
+                        val g4 = (p shr 12) and 0xF
+                        val b4 = (p shr 4) and 0xF
+                        val a4 = p shr 28
+                        row[x*2] = ((r4 shl 4) or g4).toByte()
+                        row[x*2+1] = ((b4 shl 4) or a4).toByte()
+                    }
+                    crc.update(row)
+                    out.write(row)
+                }
+            } else {
+                // RGBA8888: ARGB int → RGBA 字节，逐行流式
+                val row = ByteArray(curW * 4)
+                val rows = rowInts!!
+                for (y in 0 until curH) {
+                    curBitmap.getPixels(rows, 0, curW, 0, y, curW, 1)
+                    for (x in 0 until curW) {
+                        val p = rows[x]
+                        row[x*4] = ((p shr 16) and 0xFF).toByte()
+                        row[x*4+1] = ((p shr 8) and 0xFF).toByte()
+                        row[x*4+2] = (p and 0xFF).toByte()
+                        row[x*4+3] = ((p shr 24) and 0xFF).toByte()
+                    }
+                    crc.update(row)
+                    out.write(row)
+                }
+            }
+
+            // 下一级 mip
+            if (it < mips - 1) {
+                val nextW = maxOf(1, (curW + 1) / 2)
+                val nextH = maxOf(1, (curH + 1) / 2)
+                val scaled = Bitmap.createScaledBitmap(curBitmap, nextW, nextH, true)
+                if (!isFirst) curBitmap.recycle()
+                curBitmap = scaled
+                isFirst = false
+                curW = nextW; curH = nextH
+            }
+        }
+        if (!isFirst) curBitmap.recycle()
+
+        // ---- 唯一一次整体复制，回填 meta（CRC 已知）----
+        val result = out.toByteArray()
         val meta = if (is4444) {
-            // PC 4444 文件实测 31 字节结构：
-            // [PVR\u0003][3,3,0,0 块 16B][PVR\u0003][CRC_][4][CRC32]
+            // PC 4444 文件实测 31 字节（PVR v3 元数据块：FourCC + Key + DataSize + Data[DataSize]）：
+            // 块1: "PVR\x03"(4) + Key=3(4) + DataSize=3(4) + Data=[00,00,00](3) = 15B
+            // 块2: "PVR\x03"(4) + Key="CRC_"(4) + DataSize=4(4) + Data=CRC32(4) = 16B
             val m = java.nio.ByteBuffer.allocate(31).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            m.putInt(0x03525650)     // "PVR\u0003"
-            m.putInt(3)              // blockSize=3（实测）
-            m.putInt(3)
-            m.putInt(0)
-            m.putInt(0)
-            m.putInt(0x03525650)     // "PVR\u0003"
-            m.putInt(0x5F435243)     // "CRC_"
-            m.putInt(4)              // dataSize
+            m.putInt(0x03525650)     // "PVR\x03" FourCC
+            m.putInt(3)              // Key=3
+            m.putInt(3)              // DataSize=3
+            m.put(0.toByte()); m.put(0.toByte()); m.put(0.toByte())  // Data = 3 字节 0
+            m.putInt(0x03525650)     // "PVR\x03" FourCC
+            m.putInt(0x5F435243)     // "CRC_" Key
+            m.putInt(4)              // DataSize=4
             m.putInt(crc.value.toInt())
             m
         } else {
             // 安卓 ASTC 文件实测 16 字节结构（K-91_skin_NM.astc.pvr）
             val m = java.nio.ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            m.putInt(0x03525650)     // "PVR\u0003"
+            m.putInt(0x03525650)     // "PVR\x03"
             m.putInt(0x5F435243)     // "CRC_"
             m.putInt(4)              // dataSize
             m.putInt(crc.value.toInt())
             m
         }
-        
-        val result = java.io.ByteArrayOutputStream()
-        result.write(header.array())
-        result.write(meta.array())
-        result.write(textureData)
-        return result.toByteArray()
+        System.arraycopy(meta.array(), 0, result, 52, metaSize)
+        return result
     }
 
     /**

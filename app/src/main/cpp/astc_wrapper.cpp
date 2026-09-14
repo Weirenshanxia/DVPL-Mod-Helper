@@ -160,15 +160,16 @@ jbyteArray astcEncodeFromArgb(
 
     if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return nullptr;
     jsize pixelCount = env->GetArrayLength(argbPixels);
-    // B5 修复：数组长度必须与 w*h 一致（防 astcenc 越界读）
-    if ((jsize)((int64_t)width * height) != pixelCount) return nullptr;
+    // B5 修复：数组至少要有 w*h 个元素（防 astcenc 越界读）；允许多余长度供 mip 复用缓冲
+    const jsize need = (jsize)((int64_t)width * height);
+    if (need > pixelCount) return nullptr;
     jint* inPixels = env->GetIntArrayElements(argbPixels, nullptr);
     if (!inPixels) return nullptr;
 
-    // ARGB int → RGBA 字节
-    const size_t dataSize = (size_t)pixelCount * 4;
+    // ARGB int → RGBA 字节（只转换 w*h 个，多余部分是 mip 复用缓冲的残留）
+    const size_t dataSize = (size_t)need * 4;
     auto rgba = std::make_unique<uint8_t[]>(dataSize);
-    for (jsize i = 0; i < pixelCount; i++) {
+    for (jsize i = 0; i < need; i++) {
         uint32_t p = (uint32_t)inPixels[i];
         rgba[i*4+0] = (p >> 16) & 0xFF; // R
         rgba[i*4+1] = (p >> 8) & 0xFF;  // G

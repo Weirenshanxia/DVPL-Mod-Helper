@@ -75,39 +75,36 @@ object DdsConverter {
     /**
      * Bitmap → DDS（BC3/BC5/BC4 编码 + mip 链）
      * BC 编码在 Kotlin 层实现（块压缩算法简单，性能足够）
+     *
+     * 内存策略（4096x4096 防闪退）：输出精确预分配（头+DX10+全部 mip 块），
+     * 全程只做一次 toByteArray 复制（旧实现纹理 + 组装结果各复制一次，峰值翻倍）
      */
     fun encodeToDds(bitmap: Bitmap, format: DdsFormat): ByteArray {
         val w = bitmap.width
         val h = bitmap.height
 
-        // mip 链（到 1x1）
-        val mips = generateSequence(w to h) { (mw, mh) ->
-            if (mw == 1 && mh == 1) null else maxOf(1, (mw + 1) / 2) to maxOf(1, (mh + 1) / 2)
-        }.takeWhile { (mw, mh) -> true }.count()
-
-        val out = java.io.ByteArrayOutputStream()
-        var curW = w; var curH = h
-        var curBitmap = bitmap
-        var isFirst = true
-
-        repeat(mips) {
-            val pixels = IntArray(curW * curH)
-            curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
-            encodeBlocksToStream(pixels, curW, curH, format, out)
-            if (it < mips - 1) {
-                val nw = maxOf(1, (curW + 1) / 2); val nh = maxOf(1, (curH + 1) / 2)
-                val scaled = Bitmap.createScaledBitmap(curBitmap, nw, nh, true)
-                if (!isFirst) curBitmap.recycle()
-                curBitmap = scaled
-                isFirst = false
-                curW = nw; curH = nh
-            }
+        // mip 链（到 1x1，与 PvrConverter 一致的数法）
+        var mips = 1
+        var mw = w; var mh = h
+        while (mw > 1 || mh > 1) {
+            mw = maxOf(1, (mw + 1) / 2); mh = maxOf(1, (mh + 1) / 2)
+            mips++
         }
-        if (!isFirst) curBitmap.recycle()
 
-        val texData = out.toByteArray()
+        // 精确总容量：128B 头（+20B DX10）+ 全部 mip 块字节
+        val hasDx10 = format != DdsFormat.BC3
+        val blockBytes = when (format) {
+            DdsFormat.BC3 -> 16L; DdsFormat.BC4 -> 8L; DdsFormat.BC5 -> 16L
+        }
+        var exactTotal = 0L
+        var ew = w; var eh = h
+        repeat(mips) {
+            exactTotal += ((ew + 3) / 4).toLong() * ((eh + 3) / 4) * blockBytes
+            ew = maxOf(1, (ew + 1) / 2); eh = maxOf(1, (eh + 1) / 2)
+        }
+        val out = java.io.ByteArrayOutputStream((128 + (if (hasDx10) 20 else 0) + exactTotal).toInt())
 
-        // DDS 头
+        // DDS 头（128B）直写流
         val buf = java.nio.ByteBuffer.allocate(128).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         buf.putInt(0x20534444)  // "DDS "
         buf.putInt(124)         // header size
@@ -137,20 +134,39 @@ object DdsConverter {
         buf.putInt(0); buf.putInt(0) // masks
         buf.putInt(0x401008)   // caps: COMPLEX|MIPMAP|TEXTURE
         buf.putInt(0); buf.putInt(0); buf.putInt(0)
-        buf.putInt(0)
+        out.write(buf.array())
 
-        val result = java.io.ByteArrayOutputStream()
-        result.write(buf.array())
         // BC4/BC5 需要 DX10 头
-        if (format != DdsFormat.BC3) {
+        if (hasDx10) {
             val dx10 = java.nio.ByteBuffer.allocate(20).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             dx10.putInt(if (format == DdsFormat.BC4) 80 else 83) // DXGI BC4_UNORM=80, BC5_UNORM=83
             dx10.putInt(3)  // DIMENSION_TEXTURE2D
             dx10.putInt(0); dx10.putInt(1); dx10.putInt(0)
-            result.write(dx10.array())
+            out.write(dx10.array())
         }
-        result.write(texData)
-        return result.toByteArray()
+
+        var curW = w; var curH = h
+        var curBitmap = bitmap
+        var isFirst = true
+
+        val maxPixels = IntArray(w * h)
+        repeat(mips) {
+            val pixels = maxPixels
+            curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
+            encodeBlocksToStream(pixels, curW, curH, format, out)
+            if (it < mips - 1) {
+                val nw = maxOf(1, (curW + 1) / 2); val nh = maxOf(1, (curH + 1) / 2)
+                val scaled = Bitmap.createScaledBitmap(curBitmap, nw, nh, true)
+                if (!isFirst) curBitmap.recycle()
+                curBitmap = scaled
+                isFirst = false
+                curW = nw; curH = nh
+            }
+        }
+        if (!isFirst) curBitmap.recycle()
+
+        // 唯一一次整体复制
+        return out.toByteArray()
     }
 
     /** 块编码：BC3（DXT5 颜色+alpha）/ BC4（R）/ BC5（R+G） */
