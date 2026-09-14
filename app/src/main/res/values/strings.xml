@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DVPL Mod Helper</string>
+    
+    <!-- 主界面 -->
+    <string name="welcome_title">DVPL Mod 工具</string>
+    <string name="welcome_subtitle">为 World of Tanks Blitz 等游戏准备的文件转换工具</string>
+    
+    <!-- 功能按钮 -->
+    <string name="btn_decode_dvpl">解码 DVPL 文件</string>
+    <string name="btn_encode_dvpl">编码为 DVPL</string>
+    <string name="btn_pvr_to_png">PVR 转 PNG</string>
+    <string name="btn_png_to_pvr">PNG 转 PVR</string>
+    <string name="btn_batch_process">批量处理</string>
+    <string name="btn_settings">设置</string>
+    
+    <!-- 文件选择 -->
+    <string name="select_file">选择文件</string>
+    <string name="select_files">选择多个文件</string>
+    <string name="select_folder">选择文件夹</string>
+    
+    <!-- 处理状态 -->
+    <string name="processing">处理中…</string>
+    <string name="processing_file">正在处理: %s</string>
+    <string name="success">完成！</string>
+    <string name="failed">失败</string>
+    <string name="cancel">取消</string>
+    
+    <!-- 结果消息 -->
+    <string name="decode_success">解码成功！已保存到: %s</string>
+    <string name="encode_success">编码成功！已保存到: %s</string>
+    <string name="batch_complete">批量处理完成：成功 %d 个，失败 %d 个</string>
+    
+    <!-- 错误消息 -->
+    <string name="error_read_file">无法读取文件</string>
+    <string name="error_write_file">无法写入文件</string>
+    <string name="error_invalid_dvpl">无效的 DVPL 文件格式</string>
+    <string name="error_invalid_pvr">无效的 PVR 文件格式</string>
+    <!-- 无权限模型（SAF），此条已废弃 -->
+    <string name="error_unknown">未知错误: %s</string>
+    
+    <!-- 设置 -->
+    <string name="settings_title">设置</string>
+    <string name="setting_compression_type">压缩类型</string>
+    <string name="setting_compression_level">压缩级别</string>
+    <string name="setting_output_folder">输出文件夹</string>
+    <string name="setting_delete_original">处理后删除原文件</string>
+    <string name="setting_auto_detect">自动检测压缩类型</string>
+    
+    <!-- 关于 -->
+    <string name="about_title">关于</string>
+    <string name="about_version">版本: %s</string>
+    <string name="about_description">DVPL Mod Helper 是一个为游戏 mod 开发者设计的文件转换工具。\n\n支持功能：\n• DVPL 编解码\n• PVR 与 PNG 互转\n• 批量处理\n• 高性能原生实现</string>
+</resources>
