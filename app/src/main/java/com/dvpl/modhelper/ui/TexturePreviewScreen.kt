@@ -4,6 +4,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.opengl.GLSurfaceView
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -39,6 +40,7 @@ fun TexturePreviewScreen(
     var infoText by remember { mutableStateOf("解析中...") }
     var exportBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var bgIndex by remember { mutableIntStateOf(0) }
     var mipCount by remember { mutableIntStateOf(1) }
     var currentMip by remember { mutableIntStateOf(0) }
     var glViewRef by remember { mutableStateOf<GLSurfaceView?>(null) }
@@ -77,12 +79,12 @@ fun TexturePreviewScreen(
                             info.width, info.height, info.blockW, info.blockH, false, mips)
                         infoText = "PVR ASTC ${info.blockW}x${info.blockH}  ${info.width}x${info.height}  ${info.mips} mips"
                     } else {
-                        // 未压缩：软解 mip0
-                        val bmp = PvrConverter.decodeToBitmap(data)
-                            ?: throw IllegalArgumentException("未压缩 PVR 解码失败")
-                        source = TextureSource.DecodedBitmaps(listOf(bmp))
-                        infoText = "PVR 未压缩  ${info.width}x${info.height}  ${info.mips} mips"
-                        exportBitmap = bmp // P6 优化：保留解码结果，导出时免二次解码
+                        // 未压缩：软解全部 mips（mip 滑条可用）
+                        val bmps = (0 until info.mips).mapNotNull { PvrConverter.decodeToBitmap(data, it) }
+                        if (bmps.isEmpty()) throw IllegalArgumentException("未压缩 PVR 解码失败")
+                        source = TextureSource.DecodedBitmaps(bmps)
+                        infoText = "PVR 未压缩  ${info.width}x${info.height}  ${bmps.size} mips"
+                        exportBitmap = bmps.first() // P6 优化：保留解码结果，导出时免二次解码
                         return@withContext
                     }
                 } else if (DdsConverter.isDdsFile(data)) {
@@ -159,12 +161,22 @@ fun TexturePreviewScreen(
                             .fillMaxWidth()
                             .pointerInput(Unit) {
                                 detectTransformGestures { _, pan, gestureZoom, _ ->
-                                    zoom = (zoom * gestureZoom).coerceIn(0.1f, 40f)
-                                    panX += pan.x / 400f / zoom
-                                    panY -= pan.y / 400f / zoom
-                                    rendererRef?.let { it.zoom = zoom; it.panX = panX; it.panY = panY }
+                                    val newZoom = zoom * gestureZoom
+                                    val newPanX = panX + pan.x * 2f / size.width
+                                    val newPanY = panY - pan.y * 2f / size.height
+                                    // clamp 后回写 UI 状态（防止滑丢）
+                                    val t = rendererRef?.setTransform(newZoom, newPanX, newPanY)
+                                    if (t != null) { zoom = t[0]; panX = t[1]; panY = t[2] }
                                     glViewRef?.requestRender()
                                 }
+                            }
+                            // 双击重置视图
+                            .pointerInput(Unit) {
+                                detectTapGestures(onDoubleTap = {
+                                    zoom = 1f; panX = 0f; panY = 0f
+                                    rendererRef?.setTransform(1f, 0f, 0f)
+                                    glViewRef?.requestRender()
+                                })
                             }
                     ) {
                         LaunchedEffect(source) {
@@ -193,6 +205,7 @@ fun TexturePreviewScreen(
                                             }
                                             if (soft != null) {
                                                 source = TextureSource.DecodedBitmaps(listOf(soft))
+                                                mipCount = 1 // 软回退只有 mip0，隐藏滑条
                                                 exportBitmap = soft
                                                 infoText += "（GPU 不支持此格式，已软解回退）"
                                             }
@@ -212,6 +225,14 @@ fun TexturePreviewScreen(
                     // 信息栏 + mip 切换
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
                         Text(infoText, style = MaterialTheme.typography.bodySmall)
+                        // 背景色切换（黑/灰/白）
+                        TextButton(onClick = {
+                            bgIndex = (bgIndex + 1) % 3
+                            rendererRef?.bgColorIndex = bgIndex
+                            glViewRef?.requestRender()
+                        }) {
+                            Text("背景：" + listOf("黑", "灰", "白")[bgIndex], style = MaterialTheme.typography.labelMedium)
+                        }
                         if (mipCount > 1) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("Mip ", style = MaterialTheme.typography.bodySmall)
@@ -221,6 +242,7 @@ fun TexturePreviewScreen(
                                         currentMip = it.toInt()
                                         rendererRef?.let { r ->
                                             r.currentMip = currentMip
+                                            r.setTransform(1f, 0f, 0f) // 尺寸变化后重置视图
                                             r.markDirty()
                                         }
                                         glViewRef?.requestRender()
@@ -233,7 +255,7 @@ fun TexturePreviewScreen(
                             }
                         }
                         Text(
-                            "双指缩放/拖动查看  （GPU 直传，无临时文件）",
+                            "双指缩放/拖动，双击重置  （GPU 直传，无临时文件）",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

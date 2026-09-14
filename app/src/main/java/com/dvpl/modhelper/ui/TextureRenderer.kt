@@ -16,6 +16,8 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     @Volatile var zoom = 1f
     @Volatile var panX = 0f
     @Volatile var panY = 0f
+    /** 背景色：0=黑 1=灰 2=白 */
+    @Volatile var bgColorIndex = 0
     @Volatile var textureDirty = true
     var isHdrRendered = false
         private set
@@ -34,13 +36,46 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     private var uPanLoc = 0
     private var uTexLoc = 0
     private var uToneMapLoc = 0
+    private var uNdcSizeLoc = 0
+    private var uBgColorLoc = 0
+    private var uPremulLoc = 0
+    // 视口与纹理尺寸（updateNdcSize 计算 contain 适配）
+    private var surfaceW = 1
+    private var surfaceH = 1
+    private var texW = 1
+    private var texH = 1
+    // zoom=1 时纹理在 NDC 空间的半尺寸（等比 contain）
+    private var ndcHalfW = 1f
+    private var ndcHalfH = 1f
     // P4 优化：复用的 direct buffer（按需扩容）
     private var uploadBuffer: ByteBuffer? = null
 
     fun markDirty() { textureDirty = true }
 
+    /** 按纹理/视口宽高比计算 contain 适配（zoom=1 完整显示不拉伸） */
+    private fun updateNdcSize() {
+        val scale = minOf(surfaceW.toFloat() / texW, surfaceH.toFloat() / texH)
+        ndcHalfW = texW * scale / surfaceW
+        ndcHalfH = texH * scale / surfaceH
+    }
+
+    /**
+     * 设置缩放/平移（带边界钳制：纹理边不超出屏幕；恰好填满时锁定居中）。
+     * @return 实际生效的 [zoom, panX, panY]
+     */
+    fun setTransform(z: Float, px: Float, py: Float): FloatArray {
+        val zz = z.coerceIn(0.1f, 40f)
+        val clampX = maxOf(0f, ndcHalfW * zz - 1f)
+        val clampY = maxOf(0f, ndcHalfH * zz - 1f)
+        zoom = zz
+        panX = px.coerceIn(-clampX, clampX)
+        panY = py.coerceIn(-clampY, clampY)
+        return floatArrayOf(zoom, panX, panY)
+    }
+
     override fun onDrawFrame(gl: GL10?) {
         if (textureDirty) uploadTexture()
+        GLES30.glClearColor(BG_COLORS[bgColorIndex], BG_COLORS[bgColorIndex], BG_COLORS[bgColorIndex], 1f)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         if (program == 0 || texId == 0) return
         GLES30.glUseProgram(program)
@@ -48,6 +83,9 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texId)
         GLES30.glUniform1f(uZoomLoc, zoom)
         GLES30.glUniform2f(uPanLoc, panX, panY)
+        GLES30.glUniform2f(uNdcSizeLoc, ndcHalfW, ndcHalfH)
+        val bgV = BG_COLORS[bgColorIndex]
+        GLES30.glUniform3f(uBgColorLoc, bgV, bgV, bgV)
         GLES30.glUniform1i(uTexLoc, 0)
         GLES30.glBindVertexArray(vao)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
@@ -55,6 +93,9 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES30.glViewport(0, 0, width, height)
+        surfaceW = width
+        surfaceH = height
+        updateNdcSize()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -128,11 +169,15 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
                     android.util.Log.e("TextureRenderer", "glCompressedTexImage2D error 0x" + Integer.toHexString(err))
                     onUploadFailed?.invoke() // F2：通知 UI 层软解回退
                 }
+                texW = mip.width; texH = mip.height
+                updateNdcSize()
                 isHdrRendered = src.isHdr
             }
             is TextureSource.DecodedBitmaps -> {
                 val bmp = src.mips.getOrElse(currentMip) { src.mips.last() }
                 GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)
+                texW = bmp.width; texH = bmp.height
+                updateNdcSize()
                 isHdrRendered = false
             }
         }
@@ -140,6 +185,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         if (program != 0) {
             GLES30.glUseProgram(program)
             GLES30.glUniform1i(uToneMapLoc, if (isHdrRendered) 1 else 0)
+            GLES30.glUniform1i(uPremulLoc, if (source is TextureSource.AstcCompressed) 1 else 0)
         }
     }
 
@@ -173,18 +219,23 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         uPanLoc = GLES30.glGetUniformLocation(program, "uPan")
         uTexLoc = GLES30.glGetUniformLocation(program, "uTex")
         uToneMapLoc = GLES30.glGetUniformLocation(program, "uToneMap")
+        uNdcSizeLoc = GLES30.glGetUniformLocation(program, "uNdcSize")
+        uBgColorLoc = GLES30.glGetUniformLocation(program, "uBgColor")
+        uPremulLoc = GLES30.glGetUniformLocation(program, "uPremul")
     }
 
     companion object {
+        private val BG_COLORS = floatArrayOf(0.08f, 0.5f, 1.0f)
         private val VERTEX_SHADER = """
             #version 300 es
             layout(location=0) in vec2 aPos;
             layout(location=1) in vec2 aUV;
             uniform float uZoom;
             uniform vec2 uPan;
+            uniform vec2 uNdcSize;
             out vec2 vUV;
             void main() {
-                vec2 pos = aPos * uZoom + uPan;
+                vec2 pos = aPos * uNdcSize * uZoom + uPan;
                 gl_Position = vec4(pos, 0.0, 1.0);
                 vUV = aUV;
             }
@@ -197,13 +248,17 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
             out vec4 fragColor;
             uniform sampler2D uTex;
             uniform bool uToneMap;
+            uniform vec3 uBgColor;
+            uniform bool uPremul;
             void main() {
                 vec4 c = texture(uTex, vUV);
                 if (uToneMap) {
                     c.rgb = c.rgb * 2.0 / (1.0 + c.rgb);
                 }
-                fragColor = vec4(c.rgb, 1.0);
-            }
-        """.trimIndent()
+                // alpha 合成：透明区域透出背景色（ASTC=直通 alpha，Bitmap=预乘 alpha）
+                vec3 rgb = uPremul ? (c.rgb + uBgColor * (1.0 - c.a))
+                                   : (c.rgb * c.a + uBgColor * (1.0 - c.a));
+                fragColor = vec4(rgb, 1.0);
+            }""".trimIndent()
     }
 }
