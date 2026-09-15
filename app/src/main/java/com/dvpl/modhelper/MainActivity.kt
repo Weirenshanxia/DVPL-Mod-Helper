@@ -39,7 +39,11 @@ import com.dvpl.modhelper.codec.DdsConverter
 import com.dvpl.modhelper.BuildConfig
 import com.dvpl.modhelper.codec.DvplCodec
 import com.dvpl.modhelper.ui.TexturePreviewScreen
+import com.dvpl.modhelper.ui.WemPlayerScreen
 import com.dvpl.modhelper.codec.PvrConverter
+import com.dvpl.modhelper.codec.WwiseConverter
+import com.dvpl.modhelper.codec.WwiseNative
+import java.io.File
 import com.dvpl.modhelper.ui.theme.DvplModHelperTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -80,7 +84,12 @@ enum class ConvertMode(val title: String, val subDirName: String) {
     DDS_TO_PNG("DDS 转 PNG", "DDS转PNG"),
     PNG_TO_DDS("PNG 转 DDS", "PNG转DDS"),
     DDS_TO_PVR("DDS 转 PVR", "跨端转换"),
-    PVR_TO_DDS("PVR 转 DDS", "跨端转换")
+    PVR_TO_DDS("PVR 转 DDS", "跨端转换"),
+    WWISE_UNPACK("Wwise 解包", "Wwise解包"),
+    WWISE_PACK("Wwise 打包", "Wwise打包"),
+    WWISE_TO_OGG("WEM 转 OGG", "Wwise转OGG"),
+    WWISE_TO_WEM("OGG 转 WEM", "OGG转WEM"),
+    WWISE_PLAY("WEM 试听", "Wwise试听")
 }
 
 /**
@@ -90,10 +99,21 @@ object Prefs {
     private const val PREFS_NAME = "dvpl_prefs"
     private const val KEY_OUTPUT_DIR = "output_dir_uri"
     private const val KEY_GROUP_BY_TYPE = "group_by_type"
+    private const val KEY_WEM_VOLUME = "wem_volume"
 
     fun getGroupByType(context: Context): Boolean =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_GROUP_BY_TYPE, true)
+
+    /** 试听音量（0..1，游戏音频多为 0dBFS 满幅，默认 30% 防炸麦） */
+    fun getWemVolume(context: Context): Float =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getFloat(KEY_WEM_VOLUME, 0.3f)
+
+    fun setWemVolume(context: Context, value: Float) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putFloat(KEY_WEM_VOLUME, value.coerceIn(0f, 1f)).apply()
+    }
 
     fun setGroupByType(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -225,6 +245,11 @@ fun MainScreen() {
                     val groupByType = groupByType
                     // P1 优化：并行处理（4 并发，保序）+ C3 修复：协作式取消
                     val results = withContext(Dispatchers.IO) {
+                        if (mode == ConvertMode.WWISE_UNPACK || mode == ConvertMode.WWISE_PACK ||
+                            mode == ConvertMode.WWISE_TO_OGG || mode == ConvertMode.WWISE_TO_WEM ||
+                            mode == ConvertMode.WWISE_PLAY) {
+                            processWwiseBatch(context, uris, mode, dirUri, groupByType)
+                        } else {
                         val dispatcher = Dispatchers.IO.limitedParallelism(4)
                         kotlinx.coroutines.coroutineScope {
                         uris.map { uri ->
@@ -313,6 +338,7 @@ fun MainScreen() {
                                         outputData = DdsConverter.encodeToDds(bitmap, ddsFmt)
                                         outputName = fileName.removeExt(".pvr") + ".dds"
                                     }
+                                    else -> throw IllegalStateException("内部错误：Wwise 模式不应走单文件分支")
                                 }
 
                                 // 保存：优先自定义目录，否则默认下载目录；按类型分文件夹
@@ -332,6 +358,7 @@ fun MainScreen() {
                             }
                         }
                         }.awaitAll()
+                        }
                     }
                     val successCount = results.count { it.second }
                     val failCount = results.size - successCount
@@ -358,12 +385,28 @@ fun MainScreen() {
         if (uris.isNotEmpty()) processFiles(uris)
     }
 
+    // ===== WEM 试听（仿纹理预览交互）=====
+    var wemPlayFiles by remember { mutableStateOf<List<Pair<Uri, String>>>(emptyList()) }
+    val wemPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            wemPlayFiles = uris.map { Pair(it, queryFileName(context, it)) }
+        }
+    }
+
     fun launchPicker(mode: ConvertMode) {
         pendingMode = mode
         // 需要质量选择的模式先弹对话框
         if (mode == ConvertMode.PNG_TO_PVR || mode == ConvertMode.PNG_TO_DDS ||
             mode == ConvertMode.PVR_TO_DDS) {
             showQualityDialog = true
+            return
+        }
+        // WEM 试听走预览屏（仿纹理预览交互），不走批量转换
+        if (mode == ConvertMode.WWISE_PLAY) {
+            wemPlayFiles = emptyList()
+            wemPickerLauncher.launch(arrayOf("*/*"))
             return
         }
         // PNG_TO_PVR/PNG_TO_DDS/PVR_TO_DDS 均已提前 return 走对话框，直接全类型选择
@@ -475,6 +518,15 @@ fun MainScreen() {
             fileUri = uri,
             fileName = name,
             onBack = { previewFile = null }
+        )
+        return
+    }
+
+    // WEM 试听屏（多文件列表）
+    if (wemPlayFiles.isNotEmpty()) {
+        WemPlayerScreen(
+            files = wemPlayFiles,
+            onBack = { wemPlayFiles = emptyList() }
         )
         return
     }
@@ -640,6 +692,49 @@ fun MainScreen() {
                     )
                 }
 
+                // ===== Wwise 音频（语音/音效） =====
+                SectionCard(title = "Wwise 音频（语音/音效）") {
+                    Text(
+                        text = "解包：从 .pck/.bnk 提取 .wem 音频，同选 SoundbanksInfo.json 可还原原始文件名并按原始目录分类，输出按库名分文件夹（同名 pck+bnk 只保留完整版）。\n" +
+                            "打包：选 1 个目标库 + 若干 .wem（同库按 ID 匹配；跨语言语音替换需同选 json 按文件名匹配）；流式库也可把同名 .pck + .bnk 一起选，一次成对重打。输出 *_repacked 文件，改名后放回游戏 WwiseSound 目录即可。\n" +
+                            "bnk 与 pck 的分工：bnk 存事件表和「预取前几 KB」，完整音频在同名 .pck 里流式加载，两者不可互换、必须成对存在。\n" +
+                            "转 OGG：把 .wem 批量转成通用 ogg（PCM 编码直出 wav），也可直接选 .pck/.bnk 整库转出；\n" +
+                            "OGG 转 WEM：把标准 Vorbis OGG 编码为游戏可用的 .wem（注意包大小上限 32KB，超限请降低质量重编码）；试听：app 内点按播放，列表显示触发事件。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FunctionButton(
+                        text = "Wwise 解包：PCK/BNK → WEM（支持批量）",
+                        icon = Icons.Default.GraphicEq,
+                        onClick = { launchPicker(ConvertMode.WWISE_UNPACK) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = "Wwise 打包：替换 WEM 重建库",
+                        icon = Icons.Default.LibraryMusic,
+                        onClick = { launchPicker(ConvertMode.WWISE_PACK) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = "WEM 转 OGG：转成通用音频（支持批量/整库）",
+                        icon = Icons.Default.AudioFile,
+                        onClick = { launchPicker(ConvertMode.WWISE_TO_OGG) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = "OGG 转 WEM：编码为游戏可用音频（支持批量）",
+                        icon = Icons.Default.Mic,
+                        onClick = { launchPicker(ConvertMode.WWISE_TO_WEM) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = "WEM 试听：选文件即点即播",
+                        icon = Icons.Default.PlayCircle,
+                        onClick = { launchPicker(ConvertMode.WWISE_PLAY) },
+                        enabled = !isProcessing
+                    )
+                }
+
                 // ===== 使用说明 =====
                 SectionCard(title = "使用说明") {
                     Text(
@@ -656,7 +751,13 @@ fun MainScreen() {
                     val context = LocalContext.current
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            text = "DVPL Mod 助手 v" + BuildConfig.VERSION_NAME + "\n为 World of Tanks Blitz 准备的纹理 / DVPL 转换工具",
+                            text = "DVPL Mod 助手 v" + BuildConfig.VERSION_NAME + "\n为 World of Tanks Blitz 准备的纹理 / DVPL / Wwise 音频转换工具",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Divider()
+                        Text(
+                            text = "Wwise 音频小知识：同名 .bnk 与 .pck 成对存在——bnk 存事件表和每个音源的前几 KB 预取，完整音频在 .pck 里按需流式加载，两者分工不同、不可互换，替换音源时需要分别重打两个文件。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -707,8 +808,8 @@ fun MainScreen() {
                         )
                         Text(
                             text = "本软件以 Apache License 2.0 开源。\n" +
-                                   "内置组件：astcenc（Apache-2.0）、bcdec（MIT）、LZ4（BSD-2-Clause），" +
-                                   "详见仓库 THIRD_PARTY_NOTICES.md",
+                                   "内置组件：astcenc（Apache-2.0）、bcdec（MIT）、LZ4（BSD-2-Clause）、" +
+                                   "ww2ogg（BSD，WEM 转 OGG），详见仓库 THIRD_PARTY_NOTICES.md",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -745,6 +846,393 @@ fun MainScreen() {
             }
         }
     }
+}
+
+/**
+ * Wwise 解包/打包批量处理（与纹理管线独立：解包多文件并行，打包按库逐个重建）
+ */
+suspend fun processWwiseBatch(
+    context: Context,
+    uris: List<Uri>,
+    mode: ConvertMode,
+    dirUri: Uri?,
+    groupByType: Boolean
+): List<Triple<String, Boolean, String>> = withContext(Dispatchers.IO) {
+    data class Sel(val uri: Uri, val name: String)
+    val sels = uris.map { Sel(it, queryFileName(context, it)) }
+
+    // SoundbanksInfo.json 识别（按文件名；自动解 DVPL 包裹），提供 wemId → 原始文件名/目录/事件
+    var info = WwiseConverter.SoundbanksInfo(emptyMap(), emptyMap(), emptyMap())
+    val jsonSels = sels.filter { it.name.contains("soundbanksinfo", ignoreCase = true) }
+    val otherSels = sels.filterNot { it.name.contains("soundbanksinfo", ignoreCase = true) }
+    for (js in jsonSels) {
+        try {
+            val raw = context.contentResolver.openInputStream(js.uri)?.use { it.readBytes() } ?: continue
+            val unwrapped = if (DvplCodec.isDvplFile(raw)) DvplCodec.decode(raw) else raw
+            val parsed = WwiseConverter.parseSoundbanksInfo(unwrapped)
+            info = WwiseConverter.SoundbanksInfo(
+                info.names + parsed.names, info.dirs + parsed.dirs,
+                // events 合并：id 同时出现在多个 json 时拼接去重
+                (info.events.keys + parsed.events.keys).associateWith { id ->
+                    ((info.events[id] ?: emptyList()) + (parsed.events[id] ?: emptyList())).distinct()
+                }
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("Wwise", "SoundbanksInfo 解析失败: " + js.name, e)
+        }
+    }
+    val nameMap = info.names
+
+    // 模式级预检查失败不抛异常（会穿透协程导致崩溃），统一转为失败记录返回
+    try {
+    if (mode == ConvertMode.WWISE_UNPACK) {
+        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .pck/.bnk 文件")
+        // 预扫描已选 .pck：完整版 id 集 + 库名集合（同名 pck+bnk 成对时 pck 副本优先，
+        // bnk 里的截断预取副本跳过，避免出现「同名 (1)」重复文件）
+        val bankNameRe = Regex("\\.(pck|bnk)(\\.dvpl)?$", RegexOption.IGNORE_CASE)
+        fun stemOf(name: String): String {
+            var s = name
+            if (s.endsWith(".dvpl", true)) s = s.dropLast(5)
+            return s.dropLast(4)
+        }
+        val pckSels = otherSels.filter { bankNameRe.containsMatchIn(it.name) && it.name.contains(".pck", true) }
+        val pckFullIds = HashSet<Long>()
+        for (sel in pckSels) {
+            try {
+                val raw = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() } ?: continue
+                val data = if (DvplCodec.isDvplFile(raw)) DvplCodec.decode(raw) else raw
+                val bank = WwiseConverter.parse(data) ?: continue
+                for (e in bank.entries) pckFullIds.add(e.id)
+            } catch (_: Exception) { /* 解析失败在并行阶段按文件报错 */ }
+        }
+        val dispatcher = Dispatchers.IO.limitedParallelism(2)
+        kotlinx.coroutines.coroutineScope {
+            otherSels.map { sel ->
+                async(dispatcher) {
+                    var fName = sel.name
+                    try {
+                        currentCoroutineContext().ensureActive()
+                        val input = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
+                            ?: throw IllegalStateException("无法读取文件")
+                        val wasDvpl = DvplCodec.isDvplFile(input)
+                        val data = if (wasDvpl) DvplCodec.decode(input) else input
+                        val bank = WwiseConverter.parse(data)
+                        if (bank == null) {
+                            // 内容嗅探：可能是改名的 json，静默跳过
+                            if (data.isNotEmpty() && data[0] == '{'.code.toByte()) {
+                                return@async Triple(sel.name, true, "跳过（JSON 命名源）")
+                            }
+                            throw IllegalStateException("不是有效的 PCK/BNK 文件")
+                        }
+                        if (bank.entries.isEmpty()) throw IllegalStateException("纯事件库（无媒体文件）")
+                        val stem = stemOf(sel.name)
+                        var extracted = 0
+                        var deduped = 0
+                        var truncWarn = 0
+                        for (e in bank.entries) {
+                            val wem = bank.extract(e)
+                            if (!bank.isPck && WwiseConverter.isTruncatedWem(wem)) {
+                                if (pckFullIds.contains(e.id)) { deduped++; continue }
+                                truncWarn++
+                            }
+                            val outName = WwiseConverter.exportName(e.id, nameMap)
+                            // 分类：Wwise解包/{库名}/（{原始目录}/...）（无名称时入库名文件夹）
+                            val dir = info.dirs[e.id]
+                            val subDir = when {
+                                !groupByType -> null
+                                dir.isNullOrEmpty() -> mode.subDirName + "/" + stem
+                                else -> mode.subDirName + "/" + stem + "/" + dir
+                            }
+                            if (dirUri != null) saveToDir(context, dirUri, outName, wem, subDir)
+                            else saveToDownloads(context, outName, wem, subDir)
+                            extracted++
+                        }
+                        val named = bank.entries.count { nameMap.containsKey(it.id) }
+                        val notes = ArrayList<String>()
+                        if (named > 0) notes.add("$named 个已按原始目录命名")
+                        else notes.add("未加载 SoundbanksInfo，仅数字 ID 命名")
+                        if (deduped > 0) notes.add("$deduped 个截断预取与所选 .pck 重复已跳过")
+                        if (truncWarn > 0) notes.add("警告：$truncWarn 个流式音频为截断预取（不完整），完整音频在同名 .pck，建议同选")
+                        Triple(sel.name, true, "提取 " + extracted + " 个 wem（" + notes.joinToString("；") + "）")
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        android.util.Log.e("WwiseUnpack", "FAIL: " + fName, e)
+                        Triple(fName, false, e.message ?: e.javaClass.simpleName)
+                    }
+                }
+            }.awaitAll()
+        }
+    } else if (mode == ConvertMode.WWISE_TO_OGG) {
+        // ===== WWISE_TO_OGG：wem → ogg（Vorbis）或 wav（PCM）；也支持 .pck/.bnk 整库直转 =====
+        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .wem 或 .pck/.bnk 文件")
+        val bankNameRe = Regex("\\.(pck|bnk)(\\.dvpl)?$", RegexOption.IGNORE_CASE)
+        val bad = otherSels.filterNot { it.name.endsWith(".wem", true) || bankNameRe.containsMatchIn(it.name) }
+        if (bad.isNotEmpty()) throw IllegalStateException("不支持的文件：" + bad.first().name +
+            "（本模式支持 .wem 单文件或 .pck/.bnk 整库）")
+        fun stemOf(name: String): String {
+            var s = name
+            if (s.endsWith(".dvpl", true)) s = s.dropLast(5)
+            return s.dropLast(4)
+        }
+        val dispatcher = Dispatchers.IO.limitedParallelism(4)
+        kotlinx.coroutines.coroutineScope {
+            otherSels.map { sel ->
+                async(dispatcher) {
+                    var fName = sel.name
+                    try {
+                        currentCoroutineContext().ensureActive()
+                        val isBank = !sel.name.endsWith(".wem", true)
+                        if (!isBank) {
+                            // ---- 单个 .wem ----
+                            val wemBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
+                                ?: throw IllegalStateException("无法读取文件")
+                            if (WwiseConverter.isTruncatedWem(wemBytes))
+                                throw IllegalStateException(
+                                    "该 wem 是流式截断预取（不完整）——完整音频在同名 .pck 中，请改选 .pck 整库转换")
+                            val id = WwiseConverter.parseWemFileName(sel.name).first
+                            val origName = id?.let { nameMap[it] }
+                            val baseName = origName ?: sel.name.removeSuffix(".wem").removeSuffix(".WEM")
+                            val dir = id?.let { info.dirs[it] }
+                            val subDir = when {
+                                !groupByType -> null
+                                dir.isNullOrEmpty() -> mode.subDirName
+                                else -> mode.subDirName + "/" + dir
+                            }
+                            if (WwiseConverter.isPcmWem(wemBytes)) {
+                                val outName = makeUniqueSafeName(baseName, "wav")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
+                                else saveToDownloads(context, outName, wemBytes, subDir)
+                                listOf(Triple(sel.name, true, "PCM 直出 WAV"))
+                            } else {
+                                val oggBytes = WwiseNative.convertWemToOgg(context, wemBytes)
+                                val outName = makeUniqueSafeName(baseName, "ogg")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, oggBytes, subDir)
+                                else saveToDownloads(context, outName, oggBytes, subDir)
+                                listOf(Triple(sel.name, true, "已转换 OGG"))
+                            }
+                        } else {
+                            // ---- .pck/.bnk 整库直转 ----
+                            val input = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
+                                ?: throw IllegalStateException("无法读取文件")
+                            val data = if (DvplCodec.isDvplFile(input)) DvplCodec.decode(input) else input
+                            val bank = WwiseConverter.parse(data)
+                                ?: throw IllegalStateException("不是有效的 PCK/BNK 文件")
+                            if (bank.entries.isEmpty())
+                                return@async listOf(Triple(sel.name, true, "跳过：纯事件库（无媒体文件）"))
+                            val stem = stemOf(sel.name)
+                            var ok = 0
+                            var oggN = 0
+                            var wavN = 0
+                            var skipped = 0
+                            var failed = 0
+                            var firstErr: String? = null
+                            for (e in bank.entries) {
+                                try {
+                                    currentCoroutineContext().ensureActive()
+                                    val wem = bank.extract(e)
+                                    if (WwiseConverter.isTruncatedWem(wem)) { skipped++; continue }
+                                    val origName = nameMap[e.id]
+                                    // 带 id 前缀命名（同解包），转回 wem 后可直接按 ID 回打
+                                    val baseName = if (origName != null) e.id.toString() + "_" + origName else e.id.toString()
+                                    val dir = info.dirs[e.id]
+                                    val subDir = when {
+                                        !groupByType -> null
+                                        dir.isNullOrEmpty() -> mode.subDirName + "/" + stem
+                                        else -> mode.subDirName + "/" + stem + "/" + dir
+                                    }
+                                    if (WwiseConverter.isPcmWem(wem)) {
+                                        val outName = makeUniqueSafeName(baseName, "wav")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, wem, subDir)
+                                        else saveToDownloads(context, outName, wem, subDir)
+                                        wavN++
+                                    } else {
+                                        val oggBytes = WwiseNative.convertWemToOgg(context, wem)
+                                        val outName = makeUniqueSafeName(baseName, "ogg")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, oggBytes, subDir)
+                                        else saveToDownloads(context, outName, oggBytes, subDir)
+                                        oggN++
+                                    }
+                                    ok++
+                                } catch (ex: Exception) {
+                                    if (ex is kotlinx.coroutines.CancellationException) throw ex
+                                    failed++
+                                    if (firstErr == null) firstErr = ex.message ?: ex.javaClass.simpleName
+                                    android.util.Log.e("WwiseOgg", "FAIL: " + fName + " #" + e.id, ex)
+                                }
+                            }
+                            val notes = ArrayList<String>()
+                            notes.add("转出 OGG " + oggN + " 个 / WAV " + wavN + " 个（输出到 " + mode.subDirName + "/" + stem + "/）")
+                            if (skipped > 0) notes.add("跳过 " + skipped + " 个截断预取（完整音频在同名 .pck，请改选 .pck）")
+                            if (failed > 0) notes.add("失败 " + failed + " 个：" + firstErr)
+                            listOf(Triple(sel.name, ok > 0, notes.joinToString("；")))
+                        }
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        android.util.Log.e("WwiseOgg", "FAIL: " + fName, e)
+                        listOf(Triple(fName, false, e.message ?: e.javaClass.simpleName))
+                    }
+                }
+            }.awaitAll().flatten()
+        }
+    } else if (mode == ConvertMode.WWISE_TO_WEM) {
+        // ===== WWISE_TO_WEM：ogg → wem（Wwise Vorbis，内联完整码书） =====
+        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .ogg 文件")
+        val bad = otherSels.filterNot { it.name.endsWith(".ogg", ignoreCase = true) }
+        if (bad.isNotEmpty()) throw IllegalStateException("不支持的文件：" + bad.first().name)
+        val dispatcher = Dispatchers.IO.limitedParallelism(4)
+        kotlinx.coroutines.coroutineScope {
+            otherSels.map { sel ->
+                async(dispatcher) {
+                    var fName = sel.name
+                    try {
+                        currentCoroutineContext().ensureActive()
+                        val oggBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
+                            ?: throw IllegalStateException("无法读取文件")
+                        if (oggBytes.size < 4 || String(oggBytes, 0, 4, Charsets.US_ASCII) != "OggS")
+                            throw IllegalArgumentException("不是有效的 OGG 文件")
+                        val wemBytes = WwiseConverter.oggToWem(oggBytes)
+                        // 结构自检（chunk 表 + 包链 + 码书同步），失败不落盘
+                        val problem = WwiseConverter.validateWemStructure(wemBytes)
+                        if (problem != null) throw IllegalStateException("编码结果自检失败：" + problem)
+                        val baseName = sel.name.removeSuffix(".ogg").removeSuffix(".OGG")
+                        val outName = makeUniqueSafeName(baseName, "wem")
+                        val subDir = if (groupByType) mode.subDirName else null
+                        if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
+                        else saveToDownloads(context, outName, wemBytes, subDir)
+                        val samples = WwiseConverter.readWemSampleCount(wemBytes)
+                        val rate = WwiseConverter.readWemSampleRate(wemBytes)
+                        val dur = if (samples > 0 && rate > 0) String.format("%.1f 秒", samples.toDouble() / rate) else ""
+                        Triple(sel.name, true, "已转换 WEM（" + wemBytes.size + "B" +
+                            (if (dur.isNotEmpty()) "，" + dur else "") + "）")
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        android.util.Log.e("OggWem", "FAIL: " + fName, e)
+                        Triple(fName, false, e.message ?: e.javaClass.simpleName)
+                    }
+                }
+            }.awaitAll()
+        }
+    } else {
+        // ===== WWISE_PACK：1 个目标库（或同名 .pck + .bnk 成对）+ 若干替换 wem（可选 json 帮跨语言名称匹配） =====
+        val bankRe = Regex("\\.(pck|bnk)(\\.dvpl)?$", RegexOption.IGNORE_CASE)
+        val banks = otherSels.filter { bankRe.containsMatchIn(it.name) }
+        val wems = otherSels.filter { it.name.endsWith(".wem", ignoreCase = true) }
+        val unknown = otherSels.filterNot { bankRe.containsMatchIn(it.name) || it.name.endsWith(".wem", ignoreCase = true) }
+        if (unknown.isNotEmpty()) throw IllegalStateException("无法识别的文件：" + unknown.first().name)
+        if (wems.isEmpty()) throw IllegalStateException("未选择 .wem 替换文件")
+
+        // 去掉 .pck/.bnk 与 .dvpl 后缀取同名主干，用于成对校验
+        fun stemOf2(n: String): String {
+            var s = n
+            if (s.endsWith(".dvpl", true)) s = s.dropLast(5)
+            if (s.endsWith(".pck", true) || s.endsWith(".bnk", true)) s = s.dropLast(4)
+            return s
+        }
+
+        if (banks.size == 2) {
+            val p = banks.firstOrNull { stemOf2(it.name) != it.name && it.name.removeSuffix(".dvpl").endsWith(".pck", true) }
+            val b = banks.firstOrNull { stemOf2(it.name) != it.name && it.name.removeSuffix(".dvpl").endsWith(".bnk", true) }
+            if (p == null || b == null || stemOf2(p.name) != stemOf2(b.name))
+                throw IllegalStateException("选择了 2 个目标库：仅支持同名的 .pck + .bnk 成对重打（把两个库和同一批 wem 一起选即可）")
+        } else if (banks.size != 1) {
+            throw IllegalStateException("需要选择 1 个 .pck/.bnk 目标库，或同名的 .pck + .bnk 一对（当前 " + banks.size + " 个）")
+        }
+        val pairMode = banks.size == 2
+
+        // 预读全部 wem（成对模式两个库都要用）
+        val wemFiles = wems.map { w ->
+            val bytes = context.contentResolver.openInputStream(w.uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("无法读取 " + w.name)
+            w.name to bytes
+        }
+
+        banks.map { bankSel ->
+            val fName = bankSel.name
+            try {
+                currentCoroutineContext().ensureActive()
+                val input = context.contentResolver.openInputStream(bankSel.uri)?.use { it.readBytes() }
+                    ?: throw IllegalStateException("无法读取文件")
+                val wasDvpl = DvplCodec.isDvplFile(input)
+                val data = if (wasDvpl) DvplCodec.decode(input) else input
+                val bank = WwiseConverter.parse(data)
+                    ?: throw IllegalStateException("不是有效的 PCK/BNK 文件")
+
+                // 目标库的 名称 → id 反查表（需 json 提供名称；同库替换走 id 直配，不依赖 json）
+                val idSet = bank.entries.map { it.id }.toHashSet()
+                val nameToId = HashMap<String, Long>()
+                for (e in bank.entries) nameMap[e.id]?.let { nameToId.putIfAbsent(it, e.id) }
+
+                val replacements = HashMap<Long, ByteArray>()
+                val unmatched = ArrayList<String>()
+                for ((wName, wemBytes) in wemFiles) {
+                    val (id, name) = WwiseConverter.parseWemFileName(wName)
+                    val bareName = wName.removeSuffix(".wem").removeSuffix(".WEM")
+                    val targetId = when {
+                        id != null && idSet.contains(id) -> id
+                        name != null && nameToId.containsKey(name) -> nameToId[name]
+                        // 无 id 前缀的自定义文件名（如 OGG 转 WEM 的输出）：按 json 原名匹配
+                        nameToId.containsKey(bareName) -> nameToId[bareName]
+                        else -> null
+                    }
+                    if (targetId == null) unmatched.add(wName)
+                    else replacements[targetId] = wemBytes
+                }
+                if (!pairMode && unmatched.isNotEmpty()) {
+                    throw IllegalStateException("以下 wem 未匹配到目标库条目（跨语言替换请同选 SoundbanksInfo.json）：" +
+                        unmatched.take(3).joinToString() + (if (unmatched.size > 3) " 等 " + unmatched.size + " 个" else ""))
+                }
+                if (replacements.isEmpty()) {
+                    return@map listOf(Triple(fName, false,
+                        if (pairMode) "该库没有匹配的 wem 条目（pck/bnk 条目本就不同，另一库应已处理），未输出文件"
+                        else "没有匹配的 wem 条目"))
+                }
+
+                val repacked = WwiseConverter.repack(bank, replacements)
+                val outData = if (wasDvpl) DvplCodec.encode(repacked.bytes, DvplCodec.COMPRESSION_LZ4_HC) else repacked.bytes
+
+                var baseName = bankSel.name
+                if (baseName.endsWith(".dvpl", ignoreCase = true)) baseName = baseName.dropLast(5)
+                val isPckName = baseName.endsWith(".pck", ignoreCase = true)
+                val stem = baseName.dropLast(4)
+                val outName = stem + "_repacked" + (if (isPckName) ".pck" else ".bnk") + (if (wasDvpl) ".dvpl" else "")
+                val subDir = if (groupByType) mode.subDirName else null
+                val savedPath = if (dirUri != null) saveToDir(context, dirUri, outName, outData, subDir)
+                else saveToDownloads(context, outName, outData, subDir)
+                val notes = ArrayList<String>()
+                notes.add("替换 " + replacements.size + " 个 wem → " + savedPath)
+                if (pairMode && unmatched.isNotEmpty())
+                    notes.add("跳过 " + unmatched.size + " 个不属于该库的 wem（pck/bnk 条目本就不同，成对时属正常）")
+                if (repacked.truncatedReplacements > 0)
+                    notes.add("其中 " + repacked.truncatedReplacements + " 个流式条目已按原库截断为预取前缀" +
+                        (if (!isPckName && !pairMode) "：请再用同一批 wem 重打同名 .pck" else ""))
+                listOf(Triple(fName, true, notes.joinToString("；")))
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                android.util.Log.e("WwisePack", "FAIL: " + fName, e)
+                listOf(Triple(fName, false, e.message ?: e.javaClass.simpleName))
+            }
+        }.flatten()
+    }
+    } catch (e: Exception) {
+        // 模式级预检查失败（选错文件类型/数量等）：转为失败记录，不再穿透协程导致应用崩溃
+        if (e is kotlinx.coroutines.CancellationException) throw e
+        android.util.Log.e("Wwise", "MODE FAIL: " + e.message, e)
+        val modeLabel = when (mode) {
+            ConvertMode.WWISE_UNPACK -> "解包"
+            ConvertMode.WWISE_PACK -> "打包"
+            ConvertMode.WWISE_TO_OGG -> "转OGG"
+            ConvertMode.WWISE_TO_WEM -> "转WEM"
+            else -> "试听"
+        }
+        listOf(Triple("Wwise " + modeLabel,
+            false, e.message ?: e.javaClass.simpleName))
+    }
+}
+
+/** wem 转换输出名：{安全基名}.{ext}（基名去掉原扩展，替换非法字符） */
+private fun makeUniqueSafeName(baseName: String, ext: String): String {
+    val safe = baseName.replace(Regex("[\\/:*?\"<>|]"), "_").take(80).ifEmpty { "audio" }
+    return "$safe.$ext"
 }
 
 private fun String.removeExt(ext: String): String {
@@ -811,8 +1299,11 @@ private fun saveToDir(
         throw IllegalStateException("导出目录不可写，请重新设置")
     }
     if (subDir != null) {
-        dir = dir.findFile(subDir)?.takeIf { it.isDirectory } ?: dir.createDirectory(subDir)
-            ?: throw IllegalStateException("无法创建分类子目录")
+        // 支持嵌套子目录（Wwise 按原始路径分类：Tracks/loops 等），逐级创建
+        for (seg in subDir.split('/').filter { it.isNotBlank() }) {
+            dir = dir.findFile(seg)?.takeIf { it.isDirectory } ?: dir.createDirectory(seg)
+                ?: throw IllegalStateException("无法创建分类子目录：" + seg)
+        }
     }
     val uniqueName = makeUniqueFileName(dir, fileName)
     val file = dir.createFile("application/octet-stream", uniqueName)

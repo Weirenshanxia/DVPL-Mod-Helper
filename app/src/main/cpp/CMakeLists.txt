@@ -82,6 +82,18 @@ target_link_libraries(pvr-codec
     z
 )
 
+# ===== wwise（WEM → OGG，ww2ogg 0.24 by hcs，BSD 许可，源码零改动） =====
+add_library(wwise SHARED
+    wwise_jni.cpp
+    ww2ogg/wwriff.cpp
+    ww2ogg/codebook.cpp
+    ww2ogg/crc.c
+)
+
+target_include_directories(wwise PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ww2ogg)
+
+target_link_libraries(wwise log)
+
 # ===== dvpl-codec（DVPL LZ4 编解码，原有） =====
 add_library(dvpl-codec SHARED
     dvpl_codec.cpp

@@ -28,6 +28,15 @@
 - **位置**：`app/src/main/cpp/lz4/`
 - **许可证**：BSD 2-Clause License（全文见下）
 
+## ww2ogg (BSD-Style License, Xiph.Org / Adam Gashlin)
+
+- **用途**：Wwise WEM（Wwise Vorbis）音频转标准 Ogg Vorbis（WEM 转 OGG / 试听）
+- **来源**：https://github.com/hcs64/ww2ogg（版本 0.24）
+- **版权**：Copyright (c) 2002, Xiph.org Foundation；Copyright (c) 2009-2016, Adam Gashlin
+- **位置**：`app/src/main/cpp/ww2ogg/`（源码零改动移植，仅移除 CLI main）
+- **附带数据**：`packed_codebooks_aoTuV_603.bin`（Vorbis 码书，随 ww2ogg 分发）
+- **许可证**：BSD 式许可（全文见 `app/src/main/cpp/ww2ogg/COPYING`）
+
 ## 其他
 
 - **zlib**：Android NDK 系统库动态链接（`libz.so`），用于 DVPL DEFLATE 类型解码，随系统分发，不包含在本项目中

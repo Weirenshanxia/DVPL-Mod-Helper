@@ -11,8 +11,8 @@ android {
         applicationId = "com.dvpl.modhelper"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
         
         // 只支持 arm64-v8a，大幅减小体积
         ndk {

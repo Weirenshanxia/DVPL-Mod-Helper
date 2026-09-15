@@ -7,7 +7,7 @@
 
 **专为坦克世界闪击战（WoT Blitz）Mod 开发者设计的安卓端图形化资源转换工具**
 
-在手机上完成 DVPL 解包/打包、ASTC 纹理与 PNG 互转、PC ↔ 安卓贴图跨端移植——无需电脑。
+在手机上完成 DVPL 解包/打包、ASTC 纹理与 PNG 互转、PC ↔ 安卓贴图跨端移植、Wwise 音频解包/试听/替换——无需电脑。
 
 ## 为什么用它？
 
@@ -16,6 +16,7 @@
 
 - 📱 **纯手机工作流**——解包、转 PNG、改图、转回、打包，全程不用电脑
 - 🔧 **格式覆盖全**——WoT 安卓端的 ASTC PVR（含游戏私有的非标准枚举）+ PC 端 DX11 RGBA4444 + DDS 全 BC 家族
+- 🔊 **音频全套**——Wwise pck/bnk 解包、WEM 试听、WEM ↔ OGG 互转、替换重打，改枪声换语音不用电脑
 - ⚡ **GPU 直显预览**——ASTC 压缩数据不经软解直接进 GPU，秒开任意贴图
 - 🚀 **轻量**——约 3 MB，无需任何权限，装完即用
 
@@ -47,6 +48,15 @@
 - GPU 不支持时自动回退软件解码
 - 支持导出 PNG
 
+### 🔊 Wwise 音频（语音/音效）
+- **解包**：从 .pck/.bnk 提取 .wem 音频；同选 SoundbanksInfo.json 可还原原始文件名并按原始目录分类，同名 pck+bnk 只保留完整版
+- **试听**：app 内点按播放，列表显示触发事件；游戏音频多为 0dBFS 满幅，默认 30% 音量防炸麦，可实时调节并记住
+- **WEM → OGG**：批量转通用 ogg（PCM 编码的 wem 直出 wav），也可直接选 .pck/.bnk 整库转出（输出按库名分文件夹）
+- **OGG → WEM**：把标准 Vorbis OGG（ffmpeg / Audacity 等导出）编码为游戏可用的 .wem，全程手机本地完成。限制：单包 < 32KB（超限提示降低质量重编码）、1/2/4 声道、不支持链式 Ogg
+- **打包替换**：选目标库 + 若干 .wem 重打（同库按 wem ID 匹配，跨语言语音替换可同选 json 按文件名匹配）；流式库支持同名 .pck + .bnk 成对重打，一次输出两个文件
+- **流式截断感知**：bnk 中约 7 成条目是「预取前几 KB」的截断副本（完整音频在同名 .pck 流式加载），解包/转 OGG/试听/打包全流程明确提示并正确处理；重打保留原库 16 字节对齐布局，未替换时输出与原库逐字节一致（可用 sha256 校验）
+- 基于 ww2ogg（BSD）移植，原生层逐帧计算精确 Ogg granule 位置，MediaPlayer 试听无爆音
+
 ### 📱 极简操作
 - 系统文件选择器（SAF）选择文件，无需任何存储权限
 - 可自定义导出目录（持久化授权）；默认导出到 Download/DVPLModHelper
@@ -70,7 +80,7 @@ Android 11+ 的 SAF 文件选择器无法进入其他应用的 Android/data 目�
 
 ## 技术栈
 - Kotlin + Jetpack Compose（Material 3）
-- C++ JNI：astcenc（Apache-2.0）、bcdec（MIT）、LZ4（BSD-2）、zlib
+- C++ JNI：astcenc（Apache-2.0）、bcdec（MIT）、LZ4（BSD-2）、zlib、ww2ogg（BSD 式，Wwise Vorbis 解码）
 - GLSurfaceView + OpenGL ES 3.0 纹理预览
 
 ## 构建
@@ -84,6 +94,7 @@ Android 11+ 的 SAF 文件选择器无法进入其他应用的 Android/data 目�
 - [astcenc](https://github.com/ARM-software/astc-encoder) — Apache-2.0（ASTC 编解码）
 - [bcdec](https://github.com/iOrange/bcdec) — MIT（BC/DXT 解码）
 - [LZ4](https://github.com/lz4/lz4) — BSD-2-Clause（DVPL 压缩）
+- [ww2ogg](https://github.com/hcs64/ww2ogg) — BSD 式（Wwise Vorbis → Ogg 解码，含 aoTuV 码书）
 
 ## 致谢
 
