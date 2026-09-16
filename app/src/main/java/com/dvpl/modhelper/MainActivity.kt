@@ -1009,6 +1009,18 @@ suspend fun processWwiseBatch(
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
                                 else saveToDownloads(context, outName, wavBytes, subDir)
                                 listOf(Triple(sel.name, true, "PtADPCM 解码 WAV"))
+                            } else if (WwiseConverter.isImaAdpcmWem(wemBytes)) {
+                                val wavBytes = WwiseConverter.decodeImaAdpcmToWav(wemBytes)
+                                val outName = makeUniqueSafeName(baseName, "wav")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                else saveToDownloads(context, outName, wavBytes, subDir)
+                                listOf(Triple(sel.name, true, "IMA ADPCM 解码 WAV"))
+                            } else if (WwiseConverter.isOpusWem(wemBytes)) {
+                                val wavBytes = WwiseConverter.decodeOpusToWav(wemBytes, context)
+                                val outName = makeUniqueSafeName(baseName, "wav")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                else saveToDownloads(context, outName, wavBytes, subDir)
+                                listOf(Triple(sel.name, true, "Opus 解码 WAV"))
                             } else {
                                 val oggBytes = WwiseNative.convertWemToOgg(context, wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "ogg")
@@ -1053,6 +1065,18 @@ suspend fun processWwiseBatch(
                                         wavN++
                                     } else if (WwiseConverter.isPtAdpcmWem(wem)) {
                                         val wavBytes = WwiseConverter.decodePtAdpcmToWav(wem)
+                                        val outName = makeUniqueSafeName(baseName, "wav")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                        else saveToDownloads(context, outName, wavBytes, subDir)
+                                        wavN++
+                                    } else if (WwiseConverter.isImaAdpcmWem(wem)) {
+                                        val wavBytes = WwiseConverter.decodeImaAdpcmToWav(wem)
+                                        val outName = makeUniqueSafeName(baseName, "wav")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                        else saveToDownloads(context, outName, wavBytes, subDir)
+                                        wavN++
+                                    } else if (WwiseConverter.isOpusWem(wem)) {
+                                        val wavBytes = WwiseConverter.decodeOpusToWav(wem, context)
                                         val outName = makeUniqueSafeName(baseName, "wav")
                                         if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
                                         else saveToDownloads(context, outName, wavBytes, subDir)

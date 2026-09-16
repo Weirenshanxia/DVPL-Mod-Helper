@@ -62,13 +62,23 @@ object WwiseConverter {
     // ---------- PCK ----------
 
     private fun parsePck(data: ByteArray): Bank? {
-        val count = readU32(data, 0x34)
-        val tableEnd = 0x38 + 20 * count
-        val dataStart = tableEnd + 4
-        if (count > 100_000 || dataStart > data.size) return null
+        // AKPK 有两种版本，由 0x0C 处的字段区分：
+        //   0x0C = 0x14 (20)：旧版，count@0x34，entry table@0x38
+        //   0x0C = 0x10 (16)：新版，count@0x30，entry table@0x34
+        // entry 结构两者相同（20B）：id, langId, size, offAbs(绝对), unk
+        val unkC = readU32(data, 0x0C)
+        val (countOff, tableStart) = when (unkC) {
+            0x14 -> Pair(0x34, 0x38)
+            0x10 -> Pair(0x30, 0x34)
+            else -> return null // 未知格式
+        }
+        val count = readU32(data, countOff)
+        if (count > 100_000) return null
+        val tableEnd = tableStart + 20 * count
+        if (tableEnd > data.size) return null
         val entries = ArrayList<WemEntry>(count)
         for (i in 0 until count) {
-            val o = 0x38 + 20 * i
+            val o = tableStart + 20 * i
             val id = readU32(data, o)
             val langId = readU32(data, o + 4)
             val size = readU32(data, o + 8)
@@ -76,6 +86,8 @@ object WwiseConverter {
             if (offAbs + size > data.size) return null // 坏表
             entries.add(WemEntry(id.toLong(), langId.toLong(), size, offAbs))
         }
+        // dataStart 仅用于 repack 定位数据区起点；从第一条 entry 的最小偏移推算
+        val dataStart = if (entries.isEmpty()) tableEnd else entries.minOf { it.offset }
         return Bank(true, entries, dataStart, data)
     }
 
@@ -422,11 +434,15 @@ object WwiseConverter {
     }
 
     /**
-     * PtADPCM wem 解码为 16bit PCM WAV。
-     * 帧结构（frameSize=fmt.blockAlign，典型 36）：
-     *   +0 s16 hist2（直接输出）+2 s16 hist1（直接输出）+4 u8 index +5.. nibble（低 4 位先）
-     * 每样本：step = 表[index][nibble].步长，index = 表[index][nibble].新索引，
-     *         sample = clamp16(step + 2*hist1 - hist2)。
+     * PtADPCM wem 解码为 16bit PCM WAV，支持单/多声道。
+     *
+     * 帧布局（external interleave，每声道独立）：
+     *   data = [ch0_frame0][ch1_frame0][ch0_frame1][ch1_frame1]...
+     *   每帧 frameSize = blockAlign / channels 字节：
+     *     +0 s16 hist2, +2 s16 hist1, +4 u8 index, +5.. nibbles（低 nibble 先）
+     *   每帧输出 samplesPerFrame = 2 + (frameSize-5)*2 个样本
+     *
+     * 多声道输出为交织 PCM：L0 R0 L1 R1 ...
      */
     fun decodePtAdpcmToWav(wem: ByteArray): ByteArray {
         var channels = 1
@@ -449,48 +465,378 @@ object WwiseConverter {
             pos += 8 + sz
         }
         if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
-        if (channels != 1) throw IllegalArgumentException("PtADPCM 多声道（$channels）暂不支持")
-        if (blockAlign < 6) throw IllegalArgumentException("PtADPCM 块大小异常（$blockAlign）")
+        if (channels < 1) throw IllegalArgumentException("PtADPCM 声道数异常（$channels）")
+        // frameSize：每个声道每帧占用的字节数
+        val frameSize = blockAlign / channels
+        if (frameSize < 6) throw IllegalArgumentException("PtADPCM 帧大小异常（blockAlign=$blockAlign channels=$channels）")
+        val samplesPerFrame = 2 + (frameSize - 5) * 2
+        // 总帧组数（每"组"包含 channels 个帧，对应同一时间段的所有声道）
+        val frameGroups = dataSize / blockAlign
+        val totalSamples = frameGroups * samplesPerFrame // 每声道样本数
         val t = ptAdpcmTable
-        val out = ShortArray((dataSize / blockAlign) * (2 + (blockAlign - 5) * 2))
-        var op = 0
-        var p = dataOff
-        val end = dataOff + dataSize - blockAlign
-        while (p <= end) {
-            var hist2 = ((wem[p].toInt() and 0xFF) or (wem[p + 1].toInt() shl 8)).toShort()
-            var hist1 = ((wem[p + 2].toInt() and 0xFF) or (wem[p + 3].toInt() shl 8)).toShort()
-            var index = wem[p + 4].toInt() and 0xFF
-            if (index > 12) index = 12
-            out[op++] = hist2
-            out[op++] = hist1
-            val nibbleCount = (blockAlign - 5) * 2
-            for (i in 0 until nibbleCount) {
-                val b = wem[p + 5 + (i shr 1)].toInt() and 0xFF
-                val n = if (i and 1 == 0) b and 0xF else (b shr 4) and 0xF
-                val ti = (index * 16 + n) * 2
-                val step = t[ti]
-                index = t[ti + 1]
-                var s = step + 2 * hist1.toInt() - hist2.toInt()
-                if (s > 32767) s = 32767 else if (s < -32768) s = -32768
-                out[op++] = s.toShort()
-                hist2 = hist1
-                hist1 = s.toShort()
+
+        // 每个声道独立解码为短整型数组
+        val chBufs = Array(channels) { ShortArray(totalSamples) }
+        for (g in 0 until frameGroups) {
+            for (ch in 0 until channels) {
+                val p = dataOff + g * blockAlign + ch * frameSize
+                var hist2 = ((wem[p].toInt() and 0xFF) or (wem[p + 1].toInt() shl 8)).toShort()
+                var hist1 = ((wem[p + 2].toInt() and 0xFF) or (wem[p + 3].toInt() shl 8)).toShort()
+                var index = wem[p + 4].toInt() and 0xFF
+                if (index > 12) index = 12
+                val base = g * samplesPerFrame
+                chBufs[ch][base]     = hist2
+                chBufs[ch][base + 1] = hist1
+                val nibbleCount = (frameSize - 5) * 2
+                for (i in 0 until nibbleCount) {
+                    val b = wem[p + 5 + (i shr 1)].toInt() and 0xFF
+                    val n = if (i and 1 == 0) b and 0xF else (b shr 4) and 0xF
+                    val ti = (index * 16 + n) * 2
+                    val step = t[ti]
+                    index = t[ti + 1]
+                    var s = step + 2 * hist1.toInt() - hist2.toInt()
+                    if (s > 32767) s = 32767 else if (s < -32768) s = -32768
+                    chBufs[ch][base + 2 + i] = s.toShort()
+                    hist2 = hist1
+                    hist1 = s.toShort()
+                }
             }
-            p += blockAlign
         }
-        val pcm = ByteArray(op * 2)
-        for (i in 0 until op) {
-            val v = out[i].toInt()
-            pcm[i * 2] = (v and 0xFF).toByte()
-            pcm[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+
+        // 交织为多声道 PCM（L0 R0 L1 R1 ...）
+        val pcm = ByteArray(totalSamples * channels * 2)
+        var op = 0
+        for (s in 0 until totalSamples) {
+            for (ch in 0 until channels) {
+                val v = chBufs[ch][s].toInt()
+                pcm[op++] = (v and 0xFF).toByte()
+                pcm[op++] = ((v shr 8) and 0xFF).toByte()
+            }
         }
+
         val wav = ByteArray(44 + pcm.size)
         "RIFF".toByteArray(Charsets.US_ASCII).copyInto(wav, 0)
         wav.writeU32(36 + pcm.size, 4)
         "WAVE".toByteArray(Charsets.US_ASCII).copyInto(wav, 8)
         "fmt ".toByteArray(Charsets.US_ASCII).copyInto(wav, 12)
         wav.writeU32(16, 16)
-        wav.writeU16(1, 20)
+        wav.writeU16(1, 20)          // PCM
+        wav.writeU16(channels, 22)
+        wav.writeU32(sampleRate, 24)
+        wav.writeU32(sampleRate * 2 * channels, 28)
+        wav.writeU16(2 * channels, 32)
+        wav.writeU16(16, 34)
+        "data".toByteArray(Charsets.US_ASCII).copyInto(wav, 36)
+        wav.writeU32(pcm.size, 40)
+        pcm.copyInto(wav, 44)
+        return wav
+    }
+
+
+    // ---------- IMA ADPCM（Wwise codec 0x0002/0x0069，MS-IMA 块交错格式） ----------
+
+    /** 标准 IMA step 表（89 项） */
+    private val imaStepTable = intArrayOf(
+        7, 8, 9, 10, 11, 12, 13, 14,
+        16, 17, 19, 21, 23, 25, 28, 31,
+        34, 37, 41, 45, 50, 55, 60, 66,
+        73, 80, 88, 97, 107, 118, 130, 143,
+        157, 173, 190, 209, 230, 253, 279, 307,
+        337, 371, 408, 449, 494, 544, 598, 658,
+        724, 796, 876, 963, 1060, 1166, 1282, 1411,
+        1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+        3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484,
+        7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+        15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+    )
+    private val imaIndexTable = intArrayOf(-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+
+    /** 检测 wem 是否为 IMA ADPCM（fmt codec 0x0002 或 0x0069） */
+    fun isImaAdpcmWem(data: ByteArray): Boolean {
+        if (data.size < 32) return false
+        if (!(data[0] == 'R'.code.toByte() && data[1] == 'I'.code.toByte() &&
+                data[2] == 'F'.code.toByte() && data[3] == 'F'.code.toByte())) return false
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val id = String(data, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(data, pos + 4)
+            if (id == "fmt ") {
+                if (pos + 8 + 2 > data.size) return false
+                val codec = (data[pos + 8].toInt() and 0xFF) or ((data[pos + 9].toInt() and 0xFF) shl 8)
+                return codec == 0x0002 || codec == 0x0069
+            }
+            pos += 8 + sz
+        }
+        return false
+    }
+
+    /**
+     * MS-IMA ADPCM wem 解码为 16bit PCM WAV。
+     *
+     * Wwise 使用 MS-IMA 块交错（internal interleave）：
+     *   帧大小 = blockAlign；每帧开头 4×channels 字节为各声道头部
+     *   （s16 hist, u8 stepIndex, u8 reserved），之后数据按 4 字节/声道交替排列。
+     *   每声道每帧样本数 = 1 + (blockAlign/channels - 4) * 2。
+     */
+    fun decodeImaAdpcmToWav(wem: ByteArray): ByteArray {
+        var channels = 1
+        var sampleRate = 22050
+        var blockAlign = 0
+        var dataOff = -1
+        var dataSize = 0
+        var pos = 12
+        while (pos + 8 <= wem.size) {
+            val id = String(wem, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(wem, pos + 4)
+            if (id == "fmt " && pos + 8 + 20 <= wem.size) {
+                channels   = (wem[pos+10].toInt() and 0xFF) or ((wem[pos+11].toInt() and 0xFF) shl 8)
+                sampleRate = readU32(wem, pos + 12)
+                blockAlign = (wem[pos+20].toInt() and 0xFF) or ((wem[pos+21].toInt() and 0xFF) shl 8)
+            } else if (id == "data") {
+                dataOff  = pos + 8
+                dataSize = sz
+            }
+            pos += 8 + sz
+        }
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
+        if (channels < 1 || channels > 8) throw IllegalArgumentException("IMA ADPCM 声道数异常（$channels）")
+        if (blockAlign < channels * 4 + 2) throw IllegalArgumentException("IMA ADPCM blockAlign 异常（$blockAlign）")
+
+        val frameSize   = blockAlign                           // 每帧总字节
+        val chFrameSize = blockAlign / channels                // 每声道每帧字节
+        val samplesPerFrame = 1 + (chFrameSize - 4) * 2       // 每声道每帧样本数
+
+        val frameCount  = dataSize / frameSize
+        val totalSamples = frameCount * samplesPerFrame
+        val pcm = ByteArray(totalSamples * channels * 2)
+        var outOff = 0
+
+        val hist  = IntArray(channels)
+        val index = IntArray(channels)
+
+        for (f in 0 until frameCount) {
+            val frameBase = dataOff + f * frameSize
+            // 读各声道帧头
+            for (ch in 0 until channels) {
+                val h = frameBase + ch * 4
+                hist[ch]  = (wem[h].toInt() and 0xFF) or (wem[h+1].toInt() shl 8)  // s16 LE
+                if (hist[ch] > 32767) hist[ch] -= 65536
+                index[ch] = wem[h+2].toInt() and 0xFF
+                if (index[ch] > 88) index[ch] = 88
+            }
+            // 写各声道第一个样本（帧头样本）
+            for (ch in 0 until channels) {
+                val v = hist[ch].coerceIn(-32768, 32767)
+                val outIdx = outOff + ch * 2
+                pcm[outIdx]   = (v and 0xFF).toByte()
+                pcm[outIdx+1] = ((v shr 8) and 0xFF).toByte()
+            }
+            outOff += channels * 2
+
+            // 解码剩余样本：数据区按 4 字节/声道交替
+            // dataStart 在帧头之后
+            val nibbleStart  = frameBase + channels * 4
+            // 每声道每组 4 字节（8 nibbles），各声道交替
+            val groupsPerCh  = (chFrameSize - 4) / 4           // 每声道 4 字节组数
+            for (g in 0 until groupsPerCh) {
+                for (ch in 0 until channels) {
+                    val byteBase = nibbleStart + g * channels * 4 + ch * 4
+                    for (bIdx in 0 until 4) {
+                        val byte = wem[byteBase + bIdx].toInt() and 0xFF
+                        for (nib in 0 until 2) {
+                            val n = if (nib == 0) byte and 0xF else (byte shr 4) and 0xF
+                            val step = imaStepTable[index[ch]]
+                            var diff = step shr 3
+                            if (n and 4 != 0) diff += step
+                            if (n and 2 != 0) diff += step shr 1
+                            if (n and 1 != 0) diff += step shr 2
+                            if (n and 8 != 0) diff = -diff
+                            hist[ch] = (hist[ch] + diff).coerceIn(-32768, 32767)
+                            index[ch] = (index[ch] + imaIndexTable[n]).coerceIn(0, 88)
+                            val v = hist[ch]
+                            val outIdx = outOff + ch * 2
+                            pcm[outIdx]   = (v and 0xFF).toByte()
+                            pcm[outIdx+1] = ((v shr 8) and 0xFF).toByte()
+                        }
+                        outOff += channels * 2
+                    }
+                }
+            }
+        }
+
+        val usedPcm = pcm.copyOf(outOff)
+        val wav = ByteArray(44 + usedPcm.size)
+        "RIFF".toByteArray(Charsets.US_ASCII).copyInto(wav, 0)
+        wav.writeU32(36 + usedPcm.size, 4)
+        "WAVE".toByteArray(Charsets.US_ASCII).copyInto(wav, 8)
+        "fmt ".toByteArray(Charsets.US_ASCII).copyInto(wav, 12)
+        wav.writeU32(16, 16)
+        wav.writeU16(1, 20)           // PCM
+        wav.writeU16(channels, 22)
+        wav.writeU32(sampleRate, 24)
+        wav.writeU32(sampleRate * 2 * channels, 28)
+        wav.writeU16(2 * channels, 32)
+        wav.writeU16(16, 34)
+        "data".toByteArray(Charsets.US_ASCII).copyInto(wav, 36)
+        wav.writeU32(usedPcm.size, 40)
+        usedPcm.copyInto(wav, 44)
+        return wav
+    }
+
+    // ---------- Wwise Opus（codec 0x3040/0x3041，Android MediaCodec 解码） ----------
+
+    /** 检测 wem 是否为 Wwise Opus（fmt codec 0x3040 或 0x3041） */
+    fun isOpusWem(data: ByteArray): Boolean {
+        if (data.size < 32) return false
+        if (!(data[0] == 'R'.code.toByte() && data[1] == 'I'.code.toByte() &&
+                data[2] == 'F'.code.toByte() && data[3] == 'F'.code.toByte())) return false
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val id = String(data, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(data, pos + 4)
+            if (id == "fmt ") {
+                if (pos + 8 + 2 > data.size) return false
+                val codec = (data[pos + 8].toInt() and 0xFF) or ((data[pos + 9].toInt() and 0xFF) shl 8)
+                return codec == 0x3040 || codec == 0x3041
+            }
+            pos += 8 + sz
+        }
+        return false
+    }
+
+    /**
+     * Wwise Opus wem 解码为 16bit PCM WAV，通过 Android MediaCodec。
+     *
+     * Wwise Opus 帧布局（0x3040 和 0x3041 相同）：
+     *   seek 块（可选）跳过；data 块中每帧：u16 帧长 + Opus packet。
+     * 通过 MediaCodec "audio/opus" 解码，需提供 OpusHead 初始化帧（19 字节）。
+     */
+    @Suppress("deprecation")
+    fun decodeOpusToWav(wem: ByteArray, context: android.content.Context): ByteArray {
+        // 1. 解析 fmt / seek / data 块
+        var channels   = 2
+        var sampleRate = 48000
+        var dataOff    = -1
+        var dataSize   = 0
+        var isWwOpus   = false   // 0x3041 = WwOpus，0x3040 = 标准 Opus 帧
+        var pos        = 12
+        while (pos + 8 <= wem.size) {
+            val id = String(wem, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(wem, pos + 4)
+            if (id == "fmt " && pos + 8 + 12 <= wem.size) {
+                val codec = (wem[pos+8].toInt() and 0xFF) or ((wem[pos+9].toInt() and 0xFF) shl 8)
+                isWwOpus = (codec == 0x3041)
+                channels   = (wem[pos+10].toInt() and 0xFF) or ((wem[pos+11].toInt() and 0xFF) shl 8)
+                sampleRate = readU32(wem, pos + 12)
+            } else if (id == "data") {
+                dataOff  = pos + 8
+                dataSize = sz
+            }
+            pos += 8 + sz
+        }
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
+        if (channels < 1 || channels > 8) throw IllegalArgumentException("Opus 声道数异常（$channels）")
+
+        // 2. 收集 Opus packets（每帧前缀 u16 长度）
+        val packets = ArrayList<ByteArray>()
+        var p = dataOff
+        val dataEnd = dataOff + dataSize
+        while (p + 2 <= dataEnd) {
+            val pktLen = (wem[p].toInt() and 0xFF) or ((wem[p+1].toInt() and 0xFF) shl 8)
+            p += 2
+            if (pktLen <= 0 || p + pktLen > dataEnd) break
+            packets.add(wem.copyOfRange(p, p + pktLen))
+            p += pktLen
+        }
+        if (packets.isEmpty()) throw IllegalArgumentException("Opus wem 无有效帧")
+
+        // 3. 构造 OpusHead（19 字节）供 MediaCodec CSD
+        val opusHead = ByteArray(19)
+        "OpusHead".toByteArray(Charsets.US_ASCII).copyInto(opusHead, 0)
+        opusHead[8]  = 1                        // version
+        opusHead[9]  = channels.toByte()
+        opusHead[10] = 0; opusHead[11] = 0      // pre-skip LE u16
+        opusHead[12] = (sampleRate and 0xFF).toByte()
+        opusHead[13] = ((sampleRate shr 8) and 0xFF).toByte()
+        opusHead[14] = ((sampleRate shr 16) and 0xFF).toByte()
+        opusHead[15] = ((sampleRate shr 24) and 0xFF).toByte()
+        opusHead[16] = 0; opusHead[17] = 0      // output gain LE s16
+        opusHead[18] = 0                         // channel mapping family
+
+        val csd0 = java.nio.ByteBuffer.wrap(opusHead)
+        // CSD-1: pre-roll = 80ms @ 48kHz = 3840 samples → nanoseconds
+        val preRollNs = 80_000_000L
+        val csd1 = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        csd1.putLong(preRollNs); csd1.flip()
+        // CSD-2: seek pre-roll (same)
+        val csd2 = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        csd2.putLong(preRollNs); csd2.flip()
+
+        val format = android.media.MediaFormat.createAudioFormat("audio/opus", sampleRate, channels)
+        format.setByteBuffer("csd-0", csd0)
+        format.setByteBuffer("csd-1", csd1)
+        format.setByteBuffer("csd-2", csd2)
+
+        val codec = android.media.MediaCodec.createDecoderByType("audio/opus")
+        codec.configure(format, null, null, 0)
+        codec.start()
+
+        val pcmOut = java.io.ByteArrayOutputStream()
+        val timeoutUs = 10_000L
+        var pktIdx = 0
+        var presentUs = 0L
+        var inputDone = false
+        var outputDone = false
+
+        try {
+            while (!outputDone) {
+                // 投递输入
+                if (!inputDone) {
+                    val inIdx = codec.dequeueInputBuffer(timeoutUs)
+                    if (inIdx >= 0) {
+                        val buf = codec.getInputBuffer(inIdx)!!
+                        if (pktIdx < packets.size) {
+                            val pkt = packets[pktIdx++]
+                            buf.clear()
+                            buf.put(pkt)
+                            codec.queueInputBuffer(inIdx, 0, pkt.size, presentUs, 0)
+                            presentUs += 20_000L   // 20ms/帧
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, 0, presentUs,
+                                android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        }
+                    }
+                }
+                // 读取输出
+                val info = android.media.MediaCodec.BufferInfo()
+                val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
+                if (outIdx >= 0) {
+                    if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        outputDone = true
+                    }
+                    val buf = codec.getOutputBuffer(outIdx)!!
+                    val bytes = ByteArray(info.size)
+                    buf.get(bytes)
+                    pcmOut.write(bytes)
+                    codec.releaseOutputBuffer(outIdx, false)
+                }
+            }
+        } finally {
+            codec.stop()
+            codec.release()
+        }
+
+        val pcm = pcmOut.toByteArray()
+        if (pcm.isEmpty()) throw IllegalStateException("Opus 解码输出为空")
+
+        val wav = ByteArray(44 + pcm.size)
+        "RIFF".toByteArray(Charsets.US_ASCII).copyInto(wav, 0)
+        wav.writeU32(36 + pcm.size, 4)
+        "WAVE".toByteArray(Charsets.US_ASCII).copyInto(wav, 8)
+        "fmt ".toByteArray(Charsets.US_ASCII).copyInto(wav, 12)
+        wav.writeU32(16, 16)
+        wav.writeU16(1, 20)           // PCM
         wav.writeU16(channels, 22)
         wav.writeU32(sampleRate, 24)
         wav.writeU32(sampleRate * 2 * channels, 28)
