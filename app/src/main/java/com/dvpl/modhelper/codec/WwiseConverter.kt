@@ -345,6 +345,163 @@ object WwiseConverter {
         return false
     }
 
+    // ---------- PtADPCM（Wwise 2019.1+ 语音编码，fmt codec 0x8311，Platinum 自定义 ADPCM） ----------
+
+    /** PtADPCM 查找表：t[(index*16+nibble)*2]=步长增量，t[+1]=新索引（低 nibble 在前） */
+    private val ptAdpcmTable = intArrayOf(
+        -14, 2, -10, 2, -7, 1, -5, 1,
+        -3, 0, -2, 0, -1, 0, 0, 0,
+        0, 0, 1, 0, 2, 0, 3, 0,
+        5, 1, 7, 1, 10, 2, 14, 2,
+        -28, 3, -20, 3, -14, 2, -10, 2,
+        -7, 1, -5, 1, -3, 1, -1, 0,
+        1, 0, 3, 1, 5, 1, 7, 1,
+        10, 2, 14, 2, 20, 3, 28, 3,
+        -56, 4, -40, 4, -28, 3, -20, 3,
+        -14, 2, -10, 2, -6, 2, -2, 1,
+        2, 1, 6, 2, 10, 2, 14, 2,
+        20, 3, 28, 3, 40, 4, 56, 4,
+        -112, 5, -80, 5, -56, 4, -40, 4,
+        -28, 3, -20, 3, -12, 3, -4, 2,
+        4, 2, 12, 3, 20, 3, 28, 3,
+        40, 4, 56, 4, 80, 5, 112, 5,
+        -224, 6, -160, 6, -112, 5, -80, 5,
+        -56, 4, -40, 4, -24, 4, -8, 3,
+        8, 3, 24, 4, 40, 4, 56, 4,
+        80, 5, 112, 5, 160, 6, 224, 6,
+        -448, 7, -320, 7, -224, 6, -160, 6,
+        -112, 5, -80, 5, -48, 5, -16, 4,
+        16, 4, 48, 5, 80, 5, 112, 5,
+        160, 6, 224, 6, 320, 7, 448, 7,
+        -896, 8, -640, 8, -448, 7, -320, 7,
+        -224, 6, -160, 6, -96, 6, -32, 5,
+        32, 5, 96, 6, 160, 6, 224, 6,
+        320, 7, 448, 7, 640, 8, 896, 8,
+        -1792, 9, -1280, 9, -896, 8, -640, 8,
+        -448, 7, -320, 7, -192, 7, -64, 6,
+        64, 6, 192, 7, 320, 7, 448, 7,
+        640, 8, 896, 8, 1280, 9, 1792, 9,
+        -3584, 10, -2560, 10, -1792, 9, -1280, 9,
+        -896, 8, -640, 8, -384, 8, -128, 7,
+        128, 7, 384, 8, 640, 8, 896, 8,
+        1280, 9, 1792, 9, 2560, 10, 3584, 10,
+        -7168, 11, -5120, 11, -3584, 10, -2560, 10,
+        -1792, 9, -1280, 9, -768, 9, -256, 8,
+        256, 8, 768, 9, 1280, 9, 1792, 9,
+        2560, 10, 3584, 10, 5120, 11, 7168, 11,
+        -14336, 11, -10240, 11, -7168, 11, -5120, 11,
+        -3584, 10, -2560, 10, -1536, 10, -512, 9,
+        512, 9, 1536, 10, 2560, 10, 3584, 10,
+        5120, 11, 7168, 11, 10240, 11, 14336, 11,
+        -28672, 11, -20480, 11, -14336, 11, -10240, 11,
+        -7168, 11, -5120, 11, -3072, 11, -1024, 10,
+        1024, 10, 3072, 11, 5120, 11, 7168, 11,
+        10240, 11, 14336, 11, 20480, 11, 28672, 11,
+        // index 12：全零（越界保护）
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    )
+
+    /** 检测 wem 是否为 PtADPCM 编码（fmt codec 0x8311，Wwise 2019.1+ 语音常用） */
+    fun isPtAdpcmWem(data: ByteArray): Boolean {
+        if (data.size < 32) return false
+        if (!(data[0] == 'R'.code.toByte() && data[1] == 'I'.code.toByte() &&
+                data[2] == 'F'.code.toByte() && data[3] == 'F'.code.toByte())) return false
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val id = String(data, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(data, pos + 4)
+            if (id == "fmt ") {
+                if (pos + 8 + 2 > data.size) return false
+                val codec = (data[pos + 8].toInt() and 0xFF) or
+                    ((data[pos + 9].toInt() and 0xFF) shl 8)
+                return codec == 0x8311
+            }
+            pos += 8 + sz
+        }
+        return false
+    }
+
+    /**
+     * PtADPCM wem 解码为 16bit PCM WAV。
+     * 帧结构（frameSize=fmt.blockAlign，典型 36）：
+     *   +0 s16 hist2（直接输出）+2 s16 hist1（直接输出）+4 u8 index +5.. nibble（低 4 位先）
+     * 每样本：step = 表[index][nibble].步长，index = 表[index][nibble].新索引，
+     *         sample = clamp16(step + 2*hist1 - hist2)。
+     */
+    fun decodePtAdpcmToWav(wem: ByteArray): ByteArray {
+        var channels = 1
+        var sampleRate = 16000
+        var blockAlign = 36
+        var dataOff = -1
+        var dataSize = 0
+        var pos = 12
+        while (pos + 8 <= wem.size) {
+            val id = String(wem, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(wem, pos + 4)
+            if (id == "fmt " && pos + 8 + 16 <= wem.size) {
+                channels = (wem[pos + 10].toInt() and 0xFF) or ((wem[pos + 11].toInt() and 0xFF) shl 8)
+                sampleRate = readU32(wem, pos + 12)
+                blockAlign = (wem[pos + 20].toInt() and 0xFF) or ((wem[pos + 21].toInt() and 0xFF) shl 8)
+            } else if (id == "data") {
+                dataOff = pos + 8
+                dataSize = sz
+            }
+            pos += 8 + sz
+        }
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
+        if (channels != 1) throw IllegalArgumentException("PtADPCM 多声道（$channels）暂不支持")
+        if (blockAlign < 6) throw IllegalArgumentException("PtADPCM 块大小异常（$blockAlign）")
+        val t = ptAdpcmTable
+        val out = ShortArray((dataSize / blockAlign) * (2 + (blockAlign - 5) * 2))
+        var op = 0
+        var p = dataOff
+        val end = dataOff + dataSize - blockAlign
+        while (p <= end) {
+            var hist2 = ((wem[p].toInt() and 0xFF) or (wem[p + 1].toInt() shl 8)).toShort()
+            var hist1 = ((wem[p + 2].toInt() and 0xFF) or (wem[p + 3].toInt() shl 8)).toShort()
+            var index = wem[p + 4].toInt() and 0xFF
+            if (index > 12) index = 12
+            out[op++] = hist2
+            out[op++] = hist1
+            val nibbleCount = (blockAlign - 5) * 2
+            for (i in 0 until nibbleCount) {
+                val b = wem[p + 5 + (i shr 1)].toInt() and 0xFF
+                val n = if (i and 1 == 0) b and 0xF else (b shr 4) and 0xF
+                val ti = (index * 16 + n) * 2
+                val step = t[ti]
+                index = t[ti + 1]
+                var s = step + 2 * hist1.toInt() - hist2.toInt()
+                if (s > 32767) s = 32767 else if (s < -32768) s = -32768
+                out[op++] = s.toShort()
+                hist2 = hist1
+                hist1 = s.toShort()
+            }
+            p += blockAlign
+        }
+        val pcm = ByteArray(op * 2)
+        for (i in 0 until op) {
+            val v = out[i].toInt()
+            pcm[i * 2] = (v and 0xFF).toByte()
+            pcm[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        val wav = ByteArray(44 + pcm.size)
+        "RIFF".toByteArray(Charsets.US_ASCII).copyInto(wav, 0)
+        wav.writeU32(36 + pcm.size, 4)
+        "WAVE".toByteArray(Charsets.US_ASCII).copyInto(wav, 8)
+        "fmt ".toByteArray(Charsets.US_ASCII).copyInto(wav, 12)
+        wav.writeU32(16, 16)
+        wav.writeU16(1, 20)
+        wav.writeU16(channels, 22)
+        wav.writeU32(sampleRate, 24)
+        wav.writeU32(sampleRate * 2 * channels, 28)
+        wav.writeU16(2 * channels, 32)
+        wav.writeU16(16, 34)
+        "data".toByteArray(Charsets.US_ASCII).copyInto(wav, 36)
+        wav.writeU32(pcm.size, 40)
+        pcm.copyInto(wav, 44)
+        return wav
+    }
+
     /** 解析导出的 wem 文件名："{id}_{原名}.wem" / "{id}.wem" → (id, 名称) */
     fun parseWemFileName(name: String): Pair<Long?, String?> {
         var base = name

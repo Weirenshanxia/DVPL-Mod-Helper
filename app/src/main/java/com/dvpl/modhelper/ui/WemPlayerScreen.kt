@@ -102,6 +102,9 @@ fun WemPlayerScreen(
                     }
                     if (WwiseConverter.isPcmWem(wemBytes)) {
                         File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wemBytes) }
+                    } else if (WwiseConverter.isPtAdpcmWem(wemBytes)) {
+                        val wavBytes = WwiseConverter.decodePtAdpcmToWav(wemBytes)
+                        File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wavBytes) }
                     } else {
                         // 原生转换 + granule 修复（无修复播放器会认为 0 秒不发声）
                         val oggBytes = WwiseNative.convertWemToOgg(context, wemBytes)

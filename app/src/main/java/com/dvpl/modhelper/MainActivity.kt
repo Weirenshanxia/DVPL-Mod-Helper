@@ -698,7 +698,7 @@ fun MainScreen() {
                         text = "解包：从 .pck/.bnk 提取 .wem 音频，同选 SoundbanksInfo.json 可还原原始文件名并按原始目录分类，输出按库名分文件夹（同名 pck+bnk 只保留完整版）。\n" +
                             "打包：选 1 个目标库 + 若干 .wem（同库按 ID 匹配；跨语言语音替换需同选 json 按文件名匹配）；流式库也可把同名 .pck + .bnk 一起选，一次成对重打。输出 *_repacked 文件，改名后放回游戏 WwiseSound 目录即可。\n" +
                             "bnk 与 pck 的分工：bnk 存事件表和「预取前几 KB」，完整音频在同名 .pck 里流式加载，两者不可互换、必须成对存在。\n" +
-                            "转 OGG：把 .wem 批量转成通用 ogg（PCM 编码直出 wav），也可直接选 .pck/.bnk 整库转出；\n" +
+                            "转 OGG：把 .wem 批量转成通用 ogg（PCM/PtADPCM 编码直出 wav），也可直接选 .pck/.bnk 整库转出；\n" +
                             "OGG 转 WEM：把标准 Vorbis OGG 编码为游戏可用的 .wem（注意包大小上限 32KB，超限请降低质量重编码）；试听：app 内点按播放，列表显示触发事件。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1003,6 +1003,12 @@ suspend fun processWwiseBatch(
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
                                 else saveToDownloads(context, outName, wemBytes, subDir)
                                 listOf(Triple(sel.name, true, "PCM 直出 WAV"))
+                            } else if (WwiseConverter.isPtAdpcmWem(wemBytes)) {
+                                val wavBytes = WwiseConverter.decodePtAdpcmToWav(wemBytes)
+                                val outName = makeUniqueSafeName(baseName, "wav")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                else saveToDownloads(context, outName, wavBytes, subDir)
+                                listOf(Triple(sel.name, true, "PtADPCM 解码 WAV"))
                             } else {
                                 val oggBytes = WwiseNative.convertWemToOgg(context, wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "ogg")
@@ -1044,6 +1050,12 @@ suspend fun processWwiseBatch(
                                         val outName = makeUniqueSafeName(baseName, "wav")
                                         if (dirUri != null) saveToDir(context, dirUri, outName, wem, subDir)
                                         else saveToDownloads(context, outName, wem, subDir)
+                                        wavN++
+                                    } else if (WwiseConverter.isPtAdpcmWem(wem)) {
+                                        val wavBytes = WwiseConverter.decodePtAdpcmToWav(wem)
+                                        val outName = makeUniqueSafeName(baseName, "wav")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                        else saveToDownloads(context, outName, wavBytes, subDir)
                                         wavN++
                                     } else {
                                         val oggBytes = WwiseNative.convertWemToOgg(context, wem)
