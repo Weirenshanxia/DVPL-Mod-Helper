@@ -250,6 +250,13 @@ fun MainScreen() {
                             mode == ConvertMode.WWISE_PLAY) {
                             processWwiseBatch(context, uris, mode, dirUri, groupByType)
                         } else {
+                        // 纹理解码内存预算限流：每 permit = 10MB，总预算 200MB（20 permits）
+                        // DVPL 模式无 Bitmap 分配，直接用并发 4 跑满 IO；纹理模式走信号量动态限流
+                        val isBitmapMode = mode == ConvertMode.DDS_TO_PNG || mode == ConvertMode.PNG_TO_DDS ||
+                            mode == ConvertMode.DDS_TO_PVR || mode == ConvertMode.PVR_TO_DDS ||
+                            mode == ConvertMode.PVR_TO_PNG || mode == ConvertMode.PNG_TO_PVR
+                        // java.util.concurrent.Semaphore 支持 acquire(n)/release(n) 原子操作，用于按 Bitmap 大小限流
+                        val bitmapSem = java.util.concurrent.Semaphore(20)
                         val dispatcher = Dispatchers.IO.limitedParallelism(4)
                         kotlinx.coroutines.coroutineScope {
                         uris.map { uri ->
@@ -275,15 +282,23 @@ fun MainScreen() {
                                         outputName = fileName + ".dvpl"
                                     }
                                     ConvertMode.PVR_TO_PNG -> {
-                                        val bitmap = PvrConverter.decodeToBitmap(inputData)
-                                            ?: run {
-                                                val info = PvrConverter.parse(inputData)
-                                                throw IllegalArgumentException("PVR 解码失败" +
-                                                    (info?.let { "（ASTC " + it.blockW + "x" + it.blockH + " " + it.width + "x" + it.height + "，详见日志）" } ?: "（格式不支持）"))
-                                            }
+                                        // 估算 Bitmap 内存（解码前探尺寸），按 10MB/permit 限流
+                                        val info0 = PvrConverter.parse(inputData)
+                                        val estBytes0 = if (info0 != null) info0.width.toLong() * info0.height * 4 else 16L * 1024 * 1024
+                                        val permits0 = maxOf(1, minOf(20, (estBytes0 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits0)
+                                        val bitmap = try {
+                                            PvrConverter.decodeToBitmap(inputData)
+                                                ?: run {
+                                                    bitmapSem.release(permits0)
+                                                    throw IllegalArgumentException("PVR 解码失败" +
+                                                        (info0?.let { "（ASTC " + it.blockW + "x" + it.blockH + " " + it.width + "x" + it.height + "，详见日志）" } ?: "（格式不支持）"))
+                                                }
+                                        } catch (e: Exception) { bitmapSem.release(permits0); throw e }
                                         val out = java.io.ByteArrayOutputStream()
                                         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
                                         bitmap.recycle()
+                                        bitmapSem.release(permits0)
                                         outputData = out.toByteArray()
                                         outputName = fileName.removeExt(".pvr") + ".png"
                                     }
@@ -292,22 +307,35 @@ fun MainScreen() {
                                             inputData[0] != 0x89.toByte() || inputData[1] != 0x50.toByte() ||
                                             inputData[2] != 0x4E.toByte() || inputData[3] != 0x47.toByte())
                                             throw IllegalArgumentException("不是有效的 PNG 文件（魔数校验失败）")
-                                        // F5 防护：先探边界，超限拒绝（防 16K PNG OOM）
                                         val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                                         android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size, opts)
                                         if (opts.outWidth > 8192 || opts.outHeight > 8192)
                                             throw IllegalArgumentException("图片过大（${opts.outWidth}x${opts.outHeight}，上限 8192）")
-                                        val bitmap = android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
-                                            ?: throw IllegalArgumentException("无法解码 PNG")
-                                        outputData = PvrConverter.encodeToPvr(bitmap, quality)
+                                        val estBytes1 = opts.outWidth.toLong() * opts.outHeight * 4
+                                        val permits1 = maxOf(1, minOf(20, (estBytes1 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits1)
+                                        val bitmap = try {
+                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
+                                                ?: throw IllegalArgumentException("无法解码 PNG")
+                                        } catch (e: Exception) { bitmapSem.release(permits1); throw e }
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
                                         outputName = fileName.removeExt(".png") + ".pvr"
                                     }
                                     ConvertMode.DDS_TO_PNG -> {
-                                        val (bitmap, _) = DdsConverter.decodeToBitmap(inputData)
-                                            ?: throw IllegalArgumentException("DDS 解码失败（格式不支持）")
+                                        // DDS 头 width@0x10 height@0x0C（标准 DDS header，偏移 128B 后）
+                                        val ddsW = if (inputData.size >= 20) (inputData[16].toInt() and 0xFF) or ((inputData[17].toInt() and 0xFF) shl 8) else 4096
+                                        val ddsH = if (inputData.size >= 16) (inputData[12].toInt() and 0xFF) or ((inputData[13].toInt() and 0xFF) shl 8) else 4096
+                                        val estBytes2 = ddsW.toLong() * ddsH * 4
+                                        val permits2 = maxOf(1, minOf(20, (estBytes2 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits2)
+                                        val (bitmap, _) = try {
+                                            DdsConverter.decodeToBitmap(inputData)
+                                                ?: throw IllegalArgumentException("DDS 解码失败（格式不支持）")
+                                        } catch (e: Exception) { bitmapSem.release(permits2); throw e }
                                         val out = java.io.ByteArrayOutputStream()
                                         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
                                         bitmap.recycle()
+                                        bitmapSem.release(permits2)
                                         outputData = out.toByteArray()
                                         outputName = fileName.removeExt(".dds") + ".png"
                                     }
@@ -316,26 +344,43 @@ fun MainScreen() {
                                             inputData[0] != 0x89.toByte() || inputData[1] != 0x50.toByte() ||
                                             inputData[2] != 0x4E.toByte() || inputData[3] != 0x47.toByte())
                                             throw IllegalArgumentException("不是有效的 PNG 文件（魔数校验失败）")
-                                        // F5 防护：先探边界，超限拒绝（防 16K PNG OOM）
                                         val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                                         android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size, opts)
                                         if (opts.outWidth > 8192 || opts.outHeight > 8192)
                                             throw IllegalArgumentException("图片过大（${opts.outWidth}x${opts.outHeight}，上限 8192）")
-                                        val bitmap = android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
-                                            ?: throw IllegalArgumentException("无法解码 PNG")
-                                        outputData = DdsConverter.encodeToDds(bitmap, ddsFmt)
+                                        val estBytes3 = opts.outWidth.toLong() * opts.outHeight * 4
+                                        val permits3 = maxOf(1, minOf(20, (estBytes3 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits3)
+                                        val bitmap = try {
+                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
+                                                ?: throw IllegalArgumentException("无法解码 PNG")
+                                        } catch (e: Exception) { bitmapSem.release(permits3); throw e }
+                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
                                         outputName = fileName.removeExt(".png") + ".dds"
                                     }
                                     ConvertMode.DDS_TO_PVR -> {
-                                        val (bitmap, _) = DdsConverter.decodeToBitmap(inputData)
-                                            ?: throw IllegalArgumentException("DDS 解码失败")
-                                        outputData = PvrConverter.encodeToPvr(bitmap, quality)
+                                        val ddsW4 = if (inputData.size >= 20) (inputData[16].toInt() and 0xFF) or ((inputData[17].toInt() and 0xFF) shl 8) else 4096
+                                        val ddsH4 = if (inputData.size >= 16) (inputData[12].toInt() and 0xFF) or ((inputData[13].toInt() and 0xFF) shl 8) else 4096
+                                        val estBytes4 = ddsW4.toLong() * ddsH4 * 4
+                                        val permits4 = maxOf(1, minOf(20, (estBytes4 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits4)
+                                        val (bitmap, _) = try {
+                                            DdsConverter.decodeToBitmap(inputData)
+                                                ?: throw IllegalArgumentException("DDS 解码失败")
+                                        } catch (e: Exception) { bitmapSem.release(permits4); throw e }
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
                                         outputName = fileName.removeExt(".dds") + ".pvr"
                                     }
                                     ConvertMode.PVR_TO_DDS -> {
-                                        val bitmap = PvrConverter.decodeToBitmap(inputData)
-                                            ?: throw IllegalArgumentException("PVR 解码失败")
-                                        outputData = DdsConverter.encodeToDds(bitmap, ddsFmt)
+                                        val info5 = PvrConverter.parse(inputData)
+                                        val estBytes5 = if (info5 != null) info5.width.toLong() * info5.height * 4 else 16L * 1024 * 1024
+                                        val permits5 = maxOf(1, minOf(20, (estBytes5 / (10L * 1024 * 1024)).toInt() + 1))
+                                        bitmapSem.acquire(permits5)
+                                        val bitmap = try {
+                                            PvrConverter.decodeToBitmap(inputData)
+                                                ?: throw IllegalArgumentException("PVR 解码失败")
+                                        } catch (e: Exception) { bitmapSem.release(permits5); throw e }
+                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
                                         outputName = fileName.removeExt(".pvr") + ".dds"
                                     }
                                     else -> throw IllegalStateException("内部错误：Wwise 模式不应走单文件分支")
