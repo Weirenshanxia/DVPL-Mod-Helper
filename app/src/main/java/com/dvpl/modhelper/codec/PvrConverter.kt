@@ -84,6 +84,14 @@ object PvrConverter {
         if (result.size < 4) return null
         val w = result[0]; val h = result[1]
         val pixels = result.copyOfRange(3, result.size)
+        // 修复：部分数据贴图（MISC 等）alpha 通道存的是全 0（未使用），
+        // 预乘 Bitmap 下 alpha=0 会把 RGB 也清零 → 转出全透明空白 PNG。
+        // alpha 全为 0 时视为未使用 alpha 通道，强制置为不透明让 RGB 可见。
+        var hasAlpha = false
+        for (p in pixels) { if (p ushr 24 != 0) { hasAlpha = true; break } }
+        if (!hasAlpha) {
+            for (i in pixels.indices) pixels[i] = pixels[i] or (0xFF shl 24)
+        }
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
     }
 
