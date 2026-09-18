@@ -65,6 +65,33 @@ object DdsConverter {
                data[2] == 0x53.toByte() && data[3] == 0x20.toByte()
     }
 
+    /**
+     * 读取 DDS 文件的色彩空间：
+     * 检测 DX10 扩展头的 DXGI format 是否为 sRGB 变体
+     * BC3_UNORM_SRGB=78, BC1_UNORM_SRGB=72（其余 BC 格式均为线性数据格式）
+     */
+    fun getColorSpaceLabel(ddsData: ByteArray): String {
+        val data = if (DvplCodec.isDvplFile(ddsData))
+            try { DvplCodec.decode(ddsData) } catch (e: Exception) { ddsData }
+        else ddsData
+        if (data.size < 4) return ""
+        val magic = (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8) or
+            ((data[2].toInt() and 0xFF) shl 16) or ((data[3].toInt() and 0xFF) shl 24)
+        if (magic != 0x20534444) return ""  // "DDS "
+        // fourCC at offset 84 (0x54)
+        if (data.size < 88) return ""
+        val fourCC = (data[84].toInt() and 0xFF) or ((data[85].toInt() and 0xFF) shl 8) or
+            ((data[86].toInt() and 0xFF) shl 16) or ((data[87].toInt() and 0xFF) shl 24)
+        if (fourCC != 0x30315844) return "线性"  // not "DX10" -> old DXT5, no sRGB flag
+        // DX10 header at offset 128, DXGI format is first u32
+        if (data.size < 132) return ""
+        val dxgi = (data[128].toInt() and 0xFF) or ((data[129].toInt() and 0xFF) shl 8) or
+            ((data[130].toInt() and 0xFF) shl 16) or ((data[131].toInt() and 0xFF) shl 24)
+        // sRGB variants: 72=BC1_UNORM_SRGB, 74=BC2_UNORM_SRGB, 78=BC3_UNORM_SRGB,
+        //                91=BC6H_UF16(HDR), 99=BC7_UNORM_SRGB
+        return if (dxgi in setOf(72, 74, 78, 99)) "sRGB" else "线性"
+    }
+
     /** DDS 输出格式 */
     enum class DdsFormat(val label: String) {
         BC3("BC3 / DXT5（标准，支持透明）"),
@@ -79,7 +106,33 @@ object DdsConverter {
      * 内存策略（4096x4096 防闪退）：输出精确预分配（头+DX10+全部 mip 块），
      * 全程只做一次 toByteArray 复制（旧实现纹理 + 组装结果各复制一次，峰值翻倍）
      */
-    fun encodeToDds(bitmap: Bitmap, format: DdsFormat): ByteArray {
+    /**
+     * sRGB → 线性查表（256项预计算，gamma 2.2 近似）
+     * 用于数据贴图（NM/RM/MISC/MASK）的像素预处理：把 Android 读进来的 sRGB 像素还原为线性值
+     */
+    private val srgbToLinear: IntArray by lazy {
+        IntArray(256) { c ->
+            val f = c / 255.0
+            (Math.pow(f, 2.2) * 255.0 + 0.5).toInt().coerceIn(0, 255)
+        }
+    }
+
+    /**
+     * 将 ARGB_8888 IntArray 原地转换：RGB 通道做 sRGB→线性校正，A 通道不变
+     */
+    private fun applyLinearize(pixels: IntArray) {
+        val lut = srgbToLinear
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val a = p ushr 24
+            val r = lut[(p shr 16) and 0xFF]
+            val g = lut[(p shr 8) and 0xFF]
+            val b = lut[p and 0xFF]
+            pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+    }
+
+    fun encodeToDds(bitmap: Bitmap, format: DdsFormat, isLinear: Boolean = false): ByteArray {
         val w = bitmap.width
         val h = bitmap.height
 
@@ -92,7 +145,8 @@ object DdsConverter {
         }
 
         // 精确总容量：128B 头（+20B DX10）+ 全部 mip 块字节
-        val hasDx10 = format != DdsFormat.BC3
+        // sRGB BC3 需要 DX10 头写 DXGI BC3_UNORM_SRGB；线性 BC3 用旧 DXT5 FourCC 即可
+        val hasDx10 = format != DdsFormat.BC3 || !isLinear
         val blockBytes = when (format) {
             DdsFormat.BC3 -> 16L; DdsFormat.BC4 -> 8L; DdsFormat.BC5 -> 16L
         }
@@ -124,10 +178,11 @@ object DdsConverter {
         // pixel format
         buf.putInt(32)          // pf size
         buf.putInt(0x4)         // DDPF_FOURCC
-        val fourCC = when (format) {
-            DdsFormat.BC3 -> 0x35545844  // "DXT5"
-            DdsFormat.BC4 -> 0x30315844  // "DX10"（BC4 需 DX10 头）
-            DdsFormat.BC5 -> 0x30315844  // "DX10"
+        // BC3 sRGB 用 DX10 头写 DXGI BC3_UNORM_SRGB(78)；线性 BC3 用 DXT5 FourCC 无 DX10 头
+        val fourCC = when {
+            format == DdsFormat.BC3 && !isLinear -> 0x30315844  // "DX10" for sRGB
+            format == DdsFormat.BC3 ->              0x35545844  // "DXT5" for linear
+            else ->                                 0x30315844  // "DX10" for BC4/BC5
         }
         buf.putInt(fourCC)
         buf.putInt(0); buf.putInt(0); buf.putInt(0); buf.putInt(0)
@@ -136,10 +191,15 @@ object DdsConverter {
         buf.putInt(0); buf.putInt(0); buf.putInt(0)
         out.write(buf.array())
 
-        // BC4/BC5 需要 DX10 头
+        // DX10 扩展头：BC4/BC5 必须；BC3 sRGB 也需要（写 DXGI_FORMAT_BC3_UNORM_SRGB=78）
         if (hasDx10) {
             val dx10 = java.nio.ByteBuffer.allocate(20).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            dx10.putInt(if (format == DdsFormat.BC4) 80 else 83) // DXGI BC4_UNORM=80, BC5_UNORM=83
+            val dxgiFormat = when {
+                format == DdsFormat.BC3 -> 78   // BC3_UNORM_SRGB
+                format == DdsFormat.BC4 -> 80   // BC4_UNORM
+                else                    -> 83   // BC5_UNORM
+            }
+            dx10.putInt(dxgiFormat)
             dx10.putInt(3)  // DIMENSION_TEXTURE2D
             dx10.putInt(0); dx10.putInt(1); dx10.putInt(0)
             out.write(dx10.array())

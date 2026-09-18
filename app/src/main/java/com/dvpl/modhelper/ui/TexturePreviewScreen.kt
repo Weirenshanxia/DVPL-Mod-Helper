@@ -77,13 +77,17 @@ fun TexturePreviewScreen(
                         }
                         source = TextureSource.AstcCompressed(
                             info.width, info.height, info.blockW, info.blockH, false, mips)
-                        infoText = "PVR ASTC ${info.blockW}x${info.blockH}  ${info.width}x${info.height}  ${info.mips} mips"
+                        val csLabel = PvrConverter.getColorSpaceLabel(data)
+                        infoText = "PVR ASTC ${info.blockW}x${info.blockH}  ${info.width}x${info.height}  ${info.mips} mips" +
+                            (if (csLabel.isNotEmpty()) "  $csLabel" else "")
                     } else {
                         // 未压缩：软解全部 mips（mip 滑条可用）
                         val bmps = (0 until info.mips).mapNotNull { PvrConverter.decodeToBitmap(data, it) }
                         if (bmps.isEmpty()) throw IllegalArgumentException("未压缩 PVR 解码失败")
                         source = TextureSource.DecodedBitmaps(bmps)
-                        infoText = "PVR 未压缩  ${info.width}x${info.height}  ${bmps.size} mips"
+                        val csLabel2 = PvrConverter.getColorSpaceLabel(data)
+                        infoText = "PVR 未压缩  ${info.width}x${info.height}  ${bmps.size} mips" +
+                            (if (csLabel2.isNotEmpty()) "  $csLabel2" else "")
                         exportBitmap = bmps.first() // P6 优化：保留解码结果，导出时免二次解码
                         return@withContext
                     }
@@ -91,7 +95,9 @@ fun TexturePreviewScreen(
                     val (bmp, format) = DdsConverter.decodeToBitmap(data)
                         ?: throw IllegalArgumentException("DDS 解码失败（格式不支持）")
                     source = TextureSource.DecodedBitmaps(listOf(bmp))
-                    infoText = "DDS ${DdsConverter.formatName(format)}  ${bmp.width}x${bmp.height}"
+                    val ddsCs = DdsConverter.getColorSpaceLabel(data)
+                    infoText = "DDS ${DdsConverter.formatName(format)}  ${bmp.width}x${bmp.height}" +
+                        (if (ddsCs.isNotEmpty()) "  $ddsCs" else "")
                     exportBitmap = bmp
                 } else {
                     throw IllegalArgumentException("不支持的文件（仅 PVR/DDS）")

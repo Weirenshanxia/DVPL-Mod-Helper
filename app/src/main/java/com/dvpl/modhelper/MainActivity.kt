@@ -173,6 +173,8 @@ fun MainScreen() {
         androidx.compose.foundation.ScrollState(0)
     }
     var ddsFormat by rememberSaveable { mutableStateOf(DdsConverter.DdsFormat.BC3) }
+    // 色彩空间：true=线性（NM/RM/MISC/MASK 数据贴图），false=sRGB（BC/ALBEDO/CM 颜色贴图）
+    var isLinear by rememberSaveable { mutableStateOf(false) }
     var showQualityDialog by remember { mutableStateOf(false) }
 
     // 导出目录状态
@@ -243,6 +245,7 @@ fun MainScreen() {
                     val quality = astcQuality
                     val ddsFmt = ddsFormat
                     val groupByType = groupByType
+                    val linear = isLinear
                     // P1 优化：并行处理（4 并发，保序）+ C3 修复：协作式取消
                     val results = withContext(Dispatchers.IO) {
                         if (mode == ConvertMode.WWISE_UNPACK || mode == ConvertMode.WWISE_PACK ||
@@ -318,7 +321,7 @@ fun MainScreen() {
                                             android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
                                                 ?: throw IllegalArgumentException("无法解码 PNG")
                                         } catch (e: Exception) { bitmapSem.release(permits1); throw e }
-                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
                                         outputName = fileName.removeExt(".png") + ".pvr"
                                     }
                                     ConvertMode.DDS_TO_PNG -> {
@@ -355,7 +358,7 @@ fun MainScreen() {
                                             android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
                                                 ?: throw IllegalArgumentException("无法解码 PNG")
                                         } catch (e: Exception) { bitmapSem.release(permits3); throw e }
-                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
+                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
                                         outputName = fileName.removeExt(".png") + ".dds"
                                     }
                                     ConvertMode.DDS_TO_PVR -> {
@@ -368,7 +371,7 @@ fun MainScreen() {
                                             DdsConverter.decodeToBitmap(inputData)
                                                 ?: throw IllegalArgumentException("DDS 解码失败")
                                         } catch (e: Exception) { bitmapSem.release(permits4); throw e }
-                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
                                         outputName = fileName.removeExt(".dds") + ".pvr"
                                     }
                                     ConvertMode.PVR_TO_DDS -> {
@@ -380,7 +383,7 @@ fun MainScreen() {
                                             PvrConverter.decodeToBitmap(inputData)
                                                 ?: throw IllegalArgumentException("PVR 解码失败")
                                         } catch (e: Exception) { bitmapSem.release(permits5); throw e }
-                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
+                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
                                         outputName = fileName.removeExt(".pvr") + ".dds"
                                     }
                                     else -> throw IllegalStateException("内部错误：Wwise 模式不应走单文件分支")
@@ -485,12 +488,7 @@ fun MainScreen() {
                             ) {
                                 RadioButton(
                                     selected = astcQuality == q,
-                                    onClick = {
-                                        astcQuality = q
-                                        showQualityDialog = false
-                                        multipleFilesLauncher.launch(arrayOf("*/*"))
-                                    // mime 放宽：部分设备对 Download 的 PNG 无 MIME 索引，转换前用魔数校验
-                                    }
+                                    onClick = { astcQuality = q }
                                 )
                                 Text(q.label, modifier = Modifier.padding(start = 8.dp))
                             }
@@ -505,23 +503,50 @@ fun MainScreen() {
                             ) {
                                 RadioButton(
                                     selected = ddsFormat == f,
-                                    onClick = {
-                                        ddsFormat = f
-                                        showQualityDialog = false
-                                        // PNG 已放宽为全类型 + 魔数校验（部分设备 MIME 索引不全）
-                                        multipleFilesLauncher.launch(arrayOf("*/*"))
-                                    }
+                                    onClick = { ddsFormat = f }
                                 )
                                 Text(f.label, modifier = Modifier.padding(start = 8.dp))
                             }
                         }
                     }
+                    // 色彩空间选项（颜色贴图 vs 数据贴图）
+                    androidx.compose.material3.Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text("色彩空间", style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(bottom = 4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = !isLinear, onClick = { isLinear = false })
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text("颜色贴图（sRGB）")
+                            Text("BC / ALBEDO / CM / SKIN 等颜色贴图",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = isLinear, onClick = { isLinear = true })
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text("数据贴图（线性）")
+                            Text("NM / RM / MISC / MASK 等非颜色贴图",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showQualityDialog = false }) {
-                    Text("取消")
-                }
+                TextButton(onClick = {
+                    showQualityDialog = false
+                    multipleFilesLauncher.launch(arrayOf("*/*"))
+                }) { Text("确认") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQualityDialog = false }) { Text("取消") }
             }
         )
     }

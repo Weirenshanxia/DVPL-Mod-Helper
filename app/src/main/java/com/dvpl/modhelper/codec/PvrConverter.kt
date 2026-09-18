@@ -56,6 +56,20 @@ object PvrConverter {
     }
 
     /**
+     * 读取 PVR v3 头的色彩空间字段（偏移 0x10，u32 LE）
+     * 返回："sRGB" / "线性" / "" (无法读取)
+     */
+    fun getColorSpaceLabel(pvrData: ByteArray): String {
+        val data = unwrap(pvrData)
+        if (data.size < 20) return ""
+        val cs = (data[16].toInt() and 0xFF) or
+            ((data[17].toInt() and 0xFF) shl 8) or
+            ((data[18].toInt() and 0xFF) shl 16) or
+            ((data[19].toInt() and 0xFF) shl 24)
+        return if (cs == 1) "sRGB" else "线性"
+    }
+
+    /**
      * 解码指定 mip → Bitmap
      */
     /** DVPL 包裹检测：.pvr.dvpl 自动解包 */
@@ -81,7 +95,7 @@ object PvrConverter {
      *  - 未压缩路径逐行 getPixels 流式写入（无整图像素缓冲，行缓冲仅 16KB）
      *  - ASTC 路径保留整图 IntArray（JNI 需要），但输出体积小（~10MB）
      */
-    fun encodeToPvr(bitmap: Bitmap, quality: AstcQuality): ByteArray {
+    fun encodeToPvr(bitmap: Bitmap, quality: AstcQuality, isLinear: Boolean = false): ByteArray {
         val w = bitmap.width
         val h = bitmap.height
 
@@ -133,7 +147,7 @@ object PvrConverter {
             header.putInt(0x61626772)
             header.putInt(0x01010101)
         }
-        header.putInt(0)            // colorSpace lRGB
+        header.putInt(if (isLinear) 0 else 1)  // colorSpace: 0=线性(NM/RM/MISC), 1=sRGB(BC/ALBEDO/CM)
         header.putInt(if (is4444) 0 else 4)  // channelType（PC 4444 文件实测为 0）
         header.putInt(h)            // height
         header.putInt(w)            // width
