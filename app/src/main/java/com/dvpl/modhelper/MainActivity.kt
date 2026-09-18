@@ -322,7 +322,7 @@ fun MainScreen() {
                                                 ?: throw IllegalArgumentException("无法解码 PNG")
                                         } catch (e: Exception) { bitmapSem.release(permits1); throw e }
                                         outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
-                                        outputName = fileName.removeExt(".png") + ".pvr"
+                                        outputName = retagFileName(fileName, pvrTag(quality))
                                     }
                                     ConvertMode.DDS_TO_PNG -> {
                                         // DDS 头 width@0x10 height@0x0C（标准 DDS header，偏移 128B 后）
@@ -359,7 +359,7 @@ fun MainScreen() {
                                                 ?: throw IllegalArgumentException("无法解码 PNG")
                                         } catch (e: Exception) { bitmapSem.release(permits3); throw e }
                                         outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
-                                        outputName = fileName.removeExt(".png") + ".dds"
+                                        outputName = retagFileName(fileName, ".dx11.dds")
                                     }
                                     ConvertMode.DDS_TO_PVR -> {
                                         val ddsW4 = if (inputData.size >= 20) (inputData[16].toInt() and 0xFF) or ((inputData[17].toInt() and 0xFF) shl 8) else 4096
@@ -372,7 +372,7 @@ fun MainScreen() {
                                                 ?: throw IllegalArgumentException("DDS 解码失败")
                                         } catch (e: Exception) { bitmapSem.release(permits4); throw e }
                                         outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
-                                        outputName = fileName.removeExt(".dds") + ".pvr"
+                                        outputName = retagFileName(fileName, pvrTag(quality))
                                     }
                                     ConvertMode.PVR_TO_DDS -> {
                                         val info5 = PvrConverter.parse(inputData)
@@ -384,7 +384,7 @@ fun MainScreen() {
                                                 ?: throw IllegalArgumentException("PVR 解码失败")
                                         } catch (e: Exception) { bitmapSem.release(permits5); throw e }
                                         outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
-                                        outputName = fileName.removeExt(".pvr") + ".dds"
+                                        outputName = retagFileName(fileName, ".dx11.dds")
                                     }
                                     else -> throw IllegalStateException("内部错误：Wwise 模式不应走单文件分支")
                                 }
@@ -447,7 +447,7 @@ fun MainScreen() {
         pendingMode = mode
         // 需要质量选择的模式先弹对话框
         if (mode == ConvertMode.PNG_TO_PVR || mode == ConvertMode.PNG_TO_DDS ||
-            mode == ConvertMode.PVR_TO_DDS) {
+            mode == ConvertMode.PVR_TO_DDS || mode == ConvertMode.DDS_TO_PVR) {
             showQualityDialog = true
             return
         }
@@ -467,18 +467,22 @@ fun MainScreen() {
             onDismissRequest = { showQualityDialog = false },
             title = {
                 Text(
-                    if (pendingMode == ConvertMode.PNG_TO_PVR) "选择 ASTC 压缩质量"
+                    if (pendingMode == ConvertMode.PNG_TO_PVR || pendingMode == ConvertMode.DDS_TO_PVR)
+                        "选择 ASTC 压缩质量"
                     else "选择 DDS 压缩格式"
                 )
                 Text(
-                    if (pendingMode == ConvertMode.PVR_TO_DDS) "（将应用于 PVR → DDS 转换）"
-                    else ""
+                    when (pendingMode) {
+                        ConvertMode.PVR_TO_DDS -> "（将应用于 PVR → DDS 转换）"
+                        ConvertMode.DDS_TO_PVR -> "（将应用于 DDS → PVR 转换）"
+                        else -> ""
+                    }
                     , style = MaterialTheme.typography.bodySmall
                 )
             },
             text = {
                 Column {
-                    if (pendingMode == ConvertMode.PNG_TO_PVR) {
+                    if (pendingMode == ConvertMode.PNG_TO_PVR || pendingMode == ConvertMode.DDS_TO_PVR) {
                         PvrConverter.AstcQuality.values().forEach { q ->
                             Row(
                                 modifier = Modifier
@@ -1340,6 +1344,25 @@ private fun makeUniqueSafeName(baseName: String, ext: String): String {
     val safe = baseName.replace(Regex("[\\/:*?\"<>|]"), "_").take(80).ifEmpty { "audio" }
     return "$safe.$ext"
 }
+
+/**
+ * 生成带平台格式标签的输出文件名（实测游戏命名约定：PC=xxx.dx11.dds，移动端=xxx.astc.pvr）
+ * 剥离输入的 .dvpl 包裹、旧格式标签（.astc/.dx11，大小写不敏感）、旧扩展名后拼上目标标签
+ * 例：xxx.dx11.dds.dvpl + ".astc.pvr" → xxx.astc.pvr
+ */
+private fun retagFileName(fileName: String, tagExt: String): String {
+    var name = fileName
+    if (name.endsWith(".dvpl", ignoreCase = true)) name = name.dropLast(5)  // 剥 dvpl 包裹
+    val dot = name.lastIndexOf('.')
+    if (dot > 0) name = name.substring(0, dot)                             // 剥旧扩展名
+    val lower = name.lowercase()
+    if (lower.endsWith(".astc") || lower.endsWith(".dx11")) name = name.dropLast(5) // 剥旧格式标签
+    return name + tagExt
+}
+
+/** PVR 输出标签：4444 是 PC DX11 格式用 .dx11.pvr，其余（ASTC/未压缩）用 .astc.pvr（与游戏数据一致） */
+private fun pvrTag(quality: PvrConverter.AstcQuality): String =
+    if (quality == PvrConverter.AstcQuality.RGBA_4444_PC) ".dx11.pvr" else ".astc.pvr"
 
 private fun String.removeExt(ext: String): String {
     // 大小写不敏感的后缀移除（.DVPL/.Png 等也能正确处理）

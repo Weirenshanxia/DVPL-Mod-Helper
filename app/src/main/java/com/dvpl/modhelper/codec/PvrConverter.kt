@@ -85,11 +85,16 @@ object PvrConverter {
         val w = result[0]; val h = result[1]
         val pixels = result.copyOfRange(3, result.size)
         // 修复：部分数据贴图（MISC 等）alpha 通道存的是全 0（未使用），
-        // 预乘 Bitmap 下 alpha=0 会把 RGB 也清零 → 转出全透明空白 PNG。
-        // alpha 全为 0 时视为未使用 alpha 通道，强制置为不透明让 RGB 可见。
-        var hasAlpha = false
-        for (p in pixels) { if (p ushr 24 != 0) { hasAlpha = true; break } }
-        if (!hasAlpha) {
+        // 预乘 Bitmap 下 alpha≈0 会把 RGB 也清零 → 转出全透明空白 PNG。
+        // alpha 最大值为噪声级别（<16/255，ASTC 压缩常数 0 通道实测 max=1）时
+        // 视为未使用 alpha 通道，强制置为不透明让 RGB 可见；
+        // 真实使用 alpha 的贴图（NM max=255 / RM max≥206）不受影响。
+        var maxAlpha = 0
+        for (p in pixels) {
+            val a = p ushr 24
+            if (a > maxAlpha) { maxAlpha = a; if (maxAlpha >= 16) break }
+        }
+        if (maxAlpha < 16) {
             for (i in pixels.indices) pixels[i] = pixels[i] or (0xFF shl 24)
         }
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)

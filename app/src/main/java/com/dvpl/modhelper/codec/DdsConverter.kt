@@ -51,6 +51,16 @@ object DdsConverter {
         if (result.size < 4) return null
         val w = result[0]; val h = result[1]; val format = result[2]
         val pixels = result.copyOfRange(3, result.size)
+        // 与 PvrConverter 相同的防护：alpha 噪声级别（<16/255）视为未使用，
+        // 强制不透明，避免预乘 Bitmap 把 RGB 清零转出空白 PNG
+        var maxAlpha = 0
+        for (p in pixels) {
+            val a = p ushr 24
+            if (a > maxAlpha) { maxAlpha = a; if (maxAlpha >= 16) break }
+        }
+        if (maxAlpha < 16) {
+            for (i in pixels.indices) pixels[i] = pixels[i] or (0xFF shl 24)
+        }
         val bitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
         return Pair(bitmap, format)
     }
