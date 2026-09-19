@@ -38,6 +38,7 @@ import androidx.documentfile.provider.DocumentFile
 import com.dvpl.modhelper.codec.DdsConverter
 import com.dvpl.modhelper.BuildConfig
 import com.dvpl.modhelper.codec.DvplCodec
+import com.dvpl.modhelper.ui.PbrEditorScreen
 import com.dvpl.modhelper.ui.TexturePreviewScreen
 import com.dvpl.modhelper.ui.WemPlayerScreen
 import com.dvpl.modhelper.codec.PvrConverter
@@ -230,6 +231,14 @@ fun MainScreen() {
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let { previewFile = Pair(it, queryFileName(context, it)) }
+    }
+
+    // ===== PBR 贴图编辑 =====
+    var pbrEditFile by remember { mutableStateOf<Pair<Uri, String>?>(null) }
+    val pbrEditLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let { pbrEditFile = Pair(it, queryFileName(context, it)) }
     }
 
     // ===== 统一的 SAF 多文件选择器（系统文件选择器，不调起媒体库） =====
@@ -596,6 +605,18 @@ fun MainScreen() {
         return
     }
 
+    // PBR 贴图编辑屏
+    if (pbrEditFile != null) {
+        val (uri, name) = pbrEditFile!!
+        PbrEditorScreen(
+            fileUri = uri,
+            fileName = name,
+            outputDirUri = outputDirUri,
+            onBack = { pbrEditFile = null }
+        )
+        return
+    }
+
     // WEM 试听屏（多文件列表）
     if (wemPlayFiles.isNotEmpty()) {
         WemPlayerScreen(
@@ -726,6 +747,12 @@ fun MainScreen() {
                         text = "预览纹理（GPU 直显 PVR/DDS）",
                         icon = Icons.Default.Visibility,
                         onClick = { previewLauncher.launch(arrayOf("*/*")) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = "PBR 贴图编辑（调色/光泽/法线/通道）",
+                        icon = Icons.Default.Tune,
+                        onClick = { pbrEditLauncher.launch(arrayOf("*/*")) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
