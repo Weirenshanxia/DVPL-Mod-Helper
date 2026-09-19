@@ -421,16 +421,12 @@ private fun exportFullRes(
             } else name
             val finalName = outName + tagExt
 
-            // SAF 写入
-            val dir = outputDirUri
-                ?: throw IllegalStateException("请先在主界面设置导出目录")
-            val docUri = android.provider.DocumentsContract.createDocument(
-                context.contentResolver, dir, "application/octet-stream", finalName
-            ) ?: throw IllegalStateException("创建文件失败（目录不可写？）")
-            context.contentResolver.openOutputStream(docUri, "wt")?.use { os ->
-                os.write(encoded); os.flush()
-            } ?: throw IllegalStateException("打开输出流失败")
-            return finalName
+            // 保存：优先自定义目录，否则默认下载目录（与批量转换一致）
+            return if (outputDirUri != null) {
+                com.dvpl.modhelper.saveToDir(context, outputDirUri, finalName, encoded)
+            } else {
+                com.dvpl.modhelper.saveToDownloads(context, finalName, encoded)
+            }
         } finally {
             outBmp.recycle()
         }

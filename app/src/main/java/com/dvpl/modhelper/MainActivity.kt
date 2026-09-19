@@ -1442,7 +1442,7 @@ private fun makeUniqueFileName(dir: DocumentFile, baseName: String): String {
 /**
  * 保存到自定义 SAF 目录
  */
-private fun saveToDir(
+internal fun saveToDir(
     context: Context,
     dirUri: Uri,
     fileName: String,
@@ -1503,7 +1503,7 @@ private fun makeUniqueMediaName(context: Context, fileName: String, subDir: Stri
 /**
  * 保存到公共下载目录（MediaStore，Android 10+ 无需权限）
  */
-private fun saveToDownloads(
+internal fun saveToDownloads(
     context: Context,
     fileName: String,
     data: ByteArray,
