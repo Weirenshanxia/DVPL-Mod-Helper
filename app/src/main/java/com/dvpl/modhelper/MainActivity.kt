@@ -1,5 +1,6 @@
 package com.dvpl.modhelper
 
+import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
@@ -59,6 +60,10 @@ private const val GITHUB_URL = "https://github.com/Weirenshanxia/DVPL-Mod-Helper
 private const val ISSUES_URL = "https://github.com/Weirenshanxia/DVPL-Mod-Helper/issues"
 
 class MainActivity : ComponentActivity() {
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(L.wrap(base))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -77,20 +82,20 @@ class MainActivity : ComponentActivity() {
 /**
  * 转换模式
  */
-enum class ConvertMode(val title: String, val subDirName: String) {
-    DVPL_DECODE("DVPL 解码", "DVPL解码"),
-    DVPL_ENCODE("DVPL 编码", "DVPL编码"),
-    PVR_TO_PNG("PVR 转 PNG", "PVR转PNG"),
-    PNG_TO_PVR("PNG 转 PVR", "PNG转PVR"),
-    DDS_TO_PNG("DDS 转 PNG", "DDS转PNG"),
-    PNG_TO_DDS("PNG 转 DDS", "PNG转DDS"),
-    DDS_TO_PVR("DDS 转 PVR", "跨端转换"),
-    PVR_TO_DDS("PVR 转 DDS", "跨端转换"),
-    WWISE_UNPACK("Wwise 解包", "Wwise解包"),
-    WWISE_PACK("Wwise 打包", "Wwise打包"),
-    WWISE_TO_OGG("WEM 转 OGG", "Wwise转OGG"),
-    WWISE_TO_WEM("OGG 转 WEM", "OGG转WEM"),
-    WWISE_PLAY("WEM 试听", "Wwise试听")
+enum class ConvertMode(@androidx.annotation.StringRes val titleRes: Int, val subDirName: String) {
+    DVPL_DECODE(R.string.mode_dvpl_decode, "DvplDecode"),
+    DVPL_ENCODE(R.string.mode_dvpl_encode, "DvplEncode"),
+    PVR_TO_PNG(R.string.mode_pvr_png, "PvrToPng"),
+    PNG_TO_PVR(R.string.mode_png_pvr, "PngToPvr"),
+    DDS_TO_PNG(R.string.mode_dds_png, "DdsToPng"),
+    PNG_TO_DDS(R.string.mode_png_dds, "PngToDds"),
+    DDS_TO_PVR(R.string.mode_dds_pvr, "CrossConvert"),
+    PVR_TO_DDS(R.string.mode_pvr_dds, "CrossConvert"),
+    WWISE_UNPACK(R.string.mode_ww_unpack, "WwiseUnpack"),
+    WWISE_PACK(R.string.mode_ww_pack, "WwisePack"),
+    WWISE_TO_OGG(R.string.mode_wem_ogg, "WwiseOgg"),
+    WWISE_TO_WEM(R.string.mode_audio_wem, "AudioToWem"),
+    WWISE_PLAY(R.string.mode_wem_play, "WwisePlay")
 }
 
 /**
@@ -147,9 +152,9 @@ private fun getDirDisplayName(context: Context, uri: Uri?): String {
     if (uri == null) return ""
     return try {
         val docFile = DocumentFile.fromTreeUri(context, uri)
-        docFile?.name ?: uri.lastPathSegment ?: "自定义目录"
+        docFile?.name ?: uri.lastPathSegment ?: L.s(R.string.l_custom_dir)
     } catch (e: Exception) {
-        uri.lastPathSegment ?: "自定义目录"
+        uri.lastPathSegment ?: L.s(R.string.l_custom_dir)
     }
 }
 
@@ -166,6 +171,8 @@ fun MainScreen() {
     var pendingMode by rememberSaveable { mutableStateOf(ConvertMode.DVPL_DECODE) }
     var astcQuality by rememberSaveable { mutableStateOf(PvrConverter.AstcQuality.ASTC_6x6) }
     var groupByType by rememberSaveable { mutableStateOf(Prefs.getGroupByType(context)) }
+    var currentLang by rememberSaveable { mutableStateOf(L.getLanguage()) }
+    var showSettingsAbout by rememberSaveable { mutableStateOf(false) }
     // 批量处理明细记录
     var batchRecords by remember { mutableStateOf<List<Triple<String, Boolean, String>>>(emptyList()) }
     var showBatchDetail by remember { mutableStateOf(false) }
@@ -193,7 +200,7 @@ fun MainScreen() {
             val hasRecords = batchRecords.isNotEmpty()
             val result = snackbarHostState.showSnackbar(
                 message = msg,
-                actionLabel = if (hasRecords) "明细" else null,
+                actionLabel = if (hasRecords) L.s(R.string.l_details) else null,
                 withDismissAction = true,
                 duration = if (hasRecords) SnackbarDuration.Long else SnackbarDuration.Short
             )
@@ -247,7 +254,7 @@ fun MainScreen() {
         if (uris.isNotEmpty()) {
             scope.launch {
                 isProcessing = true
-                processingStatus = "正在处理 " + uris.size + " 个文件..."
+                processingStatus = L.s(R.string.x_processing_n, uris.size)
                 try {
                     val dirUri = outputDirUri
                     val mode = pendingMode
@@ -277,7 +284,7 @@ fun MainScreen() {
                             try {
                                 currentCoroutineContext().ensureActive() // C3：取消检查
                                 val input = context.contentResolver.openInputStream(uri)
-                                    ?: throw IllegalStateException("无法读取文件")
+                                    ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                                 val inputData = input.use { it.readBytes() }
                                 val fileName = queryFileName(context, uri)
                                 fName = fileName
@@ -303,8 +310,8 @@ fun MainScreen() {
                                             PvrConverter.decodeToBitmap(inputData)
                                                 ?: run {
                                                     bitmapSem.release(permits0)
-                                                    throw IllegalArgumentException("PVR 解码失败" +
-                                                        (info0?.let { "（ASTC " + it.blockW + "x" + it.blockH + " " + it.width + "x" + it.height + "，详见日志）" } ?: "（格式不支持）"))
+                                                    throw IllegalArgumentException(L.s(R.string.e_pvr_decode) +
+                                                        (info0?.let { "（ASTC " + it.blockW + "x" + it.blockH + " " + it.width + "x" + it.height + L.s(R.string.x_see_log) } ?: L.s(R.string.x_fmt_unsupported)))
                                                 }
                                         } catch (e: Exception) { bitmapSem.release(permits0); throw e }
                                         val out = java.io.ByteArrayOutputStream()
@@ -318,17 +325,17 @@ fun MainScreen() {
                                         if (inputData.size < 8 ||
                                             inputData[0] != 0x89.toByte() || inputData[1] != 0x50.toByte() ||
                                             inputData[2] != 0x4E.toByte() || inputData[3] != 0x47.toByte())
-                                            throw IllegalArgumentException("不是有效的 PNG 文件（魔数校验失败）")
+                                            throw IllegalArgumentException(L.s(R.string.e_png_magic))
                                         val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                                         android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size, opts)
                                         if (opts.outWidth > 8192 || opts.outHeight > 8192)
-                                            throw IllegalArgumentException("图片过大（${opts.outWidth}x${opts.outHeight}，上限 8192）")
+                                            throw IllegalArgumentException(L.s(R.string.tpl_img_too_big8k, opts.outWidth, opts.outHeight))
                                         val estBytes1 = opts.outWidth.toLong() * opts.outHeight * 4
                                         val permits1 = maxOf(1, minOf(20, (estBytes1 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits1)
                                         val bitmap = try {
                                             android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
-                                                ?: throw IllegalArgumentException("无法解码 PNG")
+                                                ?: throw IllegalArgumentException(L.s(R.string.e_png_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits1); throw e }
                                         outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
                                         outputName = retagFileName(fileName, pvrTag(quality))
@@ -342,7 +349,7 @@ fun MainScreen() {
                                         bitmapSem.acquire(permits2)
                                         val (bitmap, _) = try {
                                             DdsConverter.decodeToBitmap(inputData)
-                                                ?: throw IllegalArgumentException("DDS 解码失败（格式不支持）")
+                                                ?: throw IllegalArgumentException(L.s(R.string.e_dds_fmt))
                                         } catch (e: Exception) { bitmapSem.release(permits2); throw e }
                                         val out = java.io.ByteArrayOutputStream()
                                         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
@@ -355,17 +362,17 @@ fun MainScreen() {
                                         if (inputData.size < 8 ||
                                             inputData[0] != 0x89.toByte() || inputData[1] != 0x50.toByte() ||
                                             inputData[2] != 0x4E.toByte() || inputData[3] != 0x47.toByte())
-                                            throw IllegalArgumentException("不是有效的 PNG 文件（魔数校验失败）")
+                                            throw IllegalArgumentException(L.s(R.string.e_png_magic))
                                         val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                                         android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size, opts)
                                         if (opts.outWidth > 8192 || opts.outHeight > 8192)
-                                            throw IllegalArgumentException("图片过大（${opts.outWidth}x${opts.outHeight}，上限 8192）")
+                                            throw IllegalArgumentException(L.s(R.string.tpl_img_too_big8k, opts.outWidth, opts.outHeight))
                                         val estBytes3 = opts.outWidth.toLong() * opts.outHeight * 4
                                         val permits3 = maxOf(1, minOf(20, (estBytes3 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits3)
                                         val bitmap = try {
                                             android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
-                                                ?: throw IllegalArgumentException("无法解码 PNG")
+                                                ?: throw IllegalArgumentException(L.s(R.string.e_png_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits3); throw e }
                                         outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
                                         outputName = retagFileName(fileName, ".dx11.dds")
@@ -378,7 +385,7 @@ fun MainScreen() {
                                         bitmapSem.acquire(permits4)
                                         val (bitmap, _) = try {
                                             DdsConverter.decodeToBitmap(inputData)
-                                                ?: throw IllegalArgumentException("DDS 解码失败")
+                                                ?: throw IllegalArgumentException(L.s(R.string.e_dds_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits4); throw e }
                                         outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
                                         outputName = retagFileName(fileName, pvrTag(quality))
@@ -390,12 +397,12 @@ fun MainScreen() {
                                         bitmapSem.acquire(permits5)
                                         val bitmap = try {
                                             PvrConverter.decodeToBitmap(inputData)
-                                                ?: throw IllegalArgumentException("PVR 解码失败")
+                                                ?: throw IllegalArgumentException(L.s(R.string.e_pvr_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits5); throw e }
                                         outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
                                         outputName = retagFileName(fileName, ".dx11.dds")
                                     }
-                                    else -> throw IllegalStateException("内部错误：Wwise 模式不应走单文件分支")
+                                    else -> throw IllegalStateException(L.s(R.string.e_internal_wise))
                                 }
 
                                 // 保存：优先自定义目录，否则默认下载目录；按类型分文件夹
@@ -422,9 +429,9 @@ fun MainScreen() {
                     batchRecords = results
                     val firstError = results.firstOrNull { !it.second }?.third
                     resultMessage = if (failCount == 0) {
-                        "✅ 成功处理 " + successCount + " 个文件"
+                        L.s(R.string.x_ok_prefix) + successCount + L.s(R.string.x_files_suffix)
                     } else {
-                        "⚠️ 成功 " + successCount + " 个，失败 " + failCount + " 个"+
+                        L.s(R.string.x_warn_ok_prefix) + successCount + L.s(R.string.x_warn_mid) + failCount + L.s(R.string.x_unit_suffix)+
                             (firstError?.let { "：" + it } ?: "")
                     }
                 } finally {
@@ -477,13 +484,13 @@ fun MainScreen() {
             title = {
                 Text(
                     if (pendingMode == ConvertMode.PNG_TO_PVR || pendingMode == ConvertMode.DDS_TO_PVR)
-                        "选择 ASTC 压缩质量"
-                    else "选择 DDS 压缩格式"
+                        L.s(R.string.x_pick_astc)
+                    else L.s(R.string.x_pick_dds)
                 )
                 Text(
                     when (pendingMode) {
-                        ConvertMode.PVR_TO_DDS -> "（将应用于 PVR → DDS 转换）"
-                        ConvertMode.DDS_TO_PVR -> "（将应用于 DDS → PVR 转换）"
+                        ConvertMode.PVR_TO_DDS -> L.s(R.string.x_applies_pvr_dds)
+                        ConvertMode.DDS_TO_PVR -> L.s(R.string.x_applies_dds_pvr)
                         else -> ""
                     }
                     , style = MaterialTheme.typography.bodySmall
@@ -503,7 +510,7 @@ fun MainScreen() {
                                     selected = astcQuality == q,
                                     onClick = { astcQuality = q }
                                 )
-                                Text(q.label, modifier = Modifier.padding(start = 8.dp))
+                                Text(L.s(q.labelRes), modifier = Modifier.padding(start = 8.dp))
                             }
                         }
                     } else {
@@ -518,13 +525,13 @@ fun MainScreen() {
                                     selected = ddsFormat == f,
                                     onClick = { ddsFormat = f }
                                 )
-                                Text(f.label, modifier = Modifier.padding(start = 8.dp))
+                                Text(L.s(f.labelRes), modifier = Modifier.padding(start = 8.dp))
                             }
                         }
                     }
                     // 色彩空间选项（颜色贴图 vs 数据贴图）
                     androidx.compose.material3.Divider(modifier = Modifier.padding(vertical = 8.dp))
-                    Text("色彩空间", style = MaterialTheme.typography.labelMedium,
+                    Text(L.s(R.string.l_colorspace), style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.padding(bottom = 4.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
@@ -532,8 +539,8 @@ fun MainScreen() {
                     ) {
                         RadioButton(selected = !isLinear, onClick = { isLinear = false })
                         Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text("颜色贴图（sRGB）")
-                            Text("BC / ALBEDO / CM / SKIN 等颜色贴图",
+                            Text(L.s(R.string.l_cs_albedo))
+                            Text(L.s(R.string.l_cs_albedo_hint),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -544,8 +551,8 @@ fun MainScreen() {
                     ) {
                         RadioButton(selected = isLinear, onClick = { isLinear = true })
                         Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text("数据贴图（线性）")
-                            Text("NM / RM / MISC / MASK 等非颜色贴图",
+                            Text(L.s(R.string.l_cs_data))
+                            Text(L.s(R.string.l_cs_data_hint),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -556,10 +563,10 @@ fun MainScreen() {
                 TextButton(onClick = {
                     showQualityDialog = false
                     multipleFilesLauncher.launch(arrayOf("*/*"))
-                }) { Text("确认") }
+                }) { Text(L.s(R.string.b_confirm)) }
             },
             dismissButton = {
-                TextButton(onClick = { showQualityDialog = false }) { Text("取消") }
+                TextButton(onClick = { showQualityDialog = false }) { Text(L.s(R.string.b_cancel)) }
             }
         )
     }
@@ -568,7 +575,7 @@ fun MainScreen() {
     if (showBatchDetail) {
         AlertDialog(
             onDismissRequest = { showBatchDetail = false },
-            title = { Text("处理明细（" + batchRecords.size + " 个）") },
+            title = { Text(L.s(R.string.x_detail_prefix) + batchRecords.size + L.s(R.string.x_detail_suffix)) },
             text = {
                 LazyColumn(
                     modifier = Modifier.heightIn(max = 420.dp),
@@ -590,7 +597,7 @@ fun MainScreen() {
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showBatchDetail = false }) { Text("关闭") }
+                TextButton(onClick = { showBatchDetail = false }) { Text(L.s(R.string.b_close)) }
             }
         )
     }
@@ -626,10 +633,12 @@ fun MainScreen() {
         return
     }
 
+    // 语言切换时强制整树重组：无参 composable 与单例 lambda 会被跳过重组
+    key(currentLang) {
         Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("DVPL Mod 助手") },
+                title = { Text(L.s(R.string.app_title)) },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -654,9 +663,9 @@ fun MainScreen() {
                 WelcomeCard()
 
                 // ===== 导出目录设置卡片 =====
-                SectionCard(title = "导出目录") {
+                SectionCard(title = L.s(R.string.l_export_dir)) {
                     Text(
-                        text = if (outputDirUri != null) "当前：" + outputDirName else "默认：Download/DVPLModHelper",
+                        text = if (outputDirUri != null) L.s(R.string.l_current) + outputDirName else L.s(R.string.l_default_dir),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 2,
@@ -674,7 +683,7 @@ fun MainScreen() {
                         ) {
                             Icon(Icons.Default.FolderOpen, contentDescription = null)
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("修改目录")
+                            Text(L.s(R.string.b_change_dir))
                         }
                         if (outputDirUri != null) {
                             OutlinedButton(
@@ -696,7 +705,7 @@ fun MainScreen() {
                                 modifier = Modifier.weight(1f),
                                 enabled = !isProcessing
                             ) {
-                                Text("恢复默认")
+                                Text(L.s(R.string.b_reset_dir))
                             }
                         }
                     }
@@ -707,9 +716,9 @@ fun MainScreen() {
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("按类型分文件夹", style = MaterialTheme.typography.bodyMedium)
+                            Text(L.s(R.string.l_group_by_type), style = MaterialTheme.typography.bodyMedium)
                             Text(
-                                "结果按转换类型保存到子目录",
+                                L.s(R.string.l_group_by_type_hint),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -726,15 +735,15 @@ fun MainScreen() {
                 }
 
                 // ===== DVPL 编解码 =====
-                SectionCard(title = "DVPL 编解码") {
+                SectionCard(title = L.s(R.string.sec_dvpl)) {
                     FunctionButton(
-                        text = "解码 DVPL → 原文件（支持多选）",
+                        text = L.s(R.string.b_decode_dvpl),
                         icon = Icons.Default.LockOpen,
                         onClick = { launchPicker(ConvertMode.DVPL_DECODE) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "编码为 DVPL（支持多选）",
+                        text = L.s(R.string.b_encode_dvpl),
                         icon = Icons.Default.Lock,
                         onClick = { launchPicker(ConvertMode.DVPL_ENCODE) },
                         enabled = !isProcessing
@@ -742,51 +751,51 @@ fun MainScreen() {
                 }
 
                 // ===== PVR / DDS 图片转换（批量） =====
-                SectionCard(title = "纹理转换") {
+                SectionCard(title = L.s(R.string.sec_texture)) {
                     FunctionButton(
-                        text = "预览纹理（GPU 直显 PVR/DDS）",
+                        text = L.s(R.string.b_preview_tex),
                         icon = Icons.Default.Visibility,
                         onClick = { previewLauncher.launch(arrayOf("*/*")) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "PBR 贴图编辑（调色/光泽/法线/通道）",
+                        text = L.s(R.string.b_pbr_editor),
                         icon = Icons.Default.Tune,
                         onClick = { pbrEditLauncher.launch(arrayOf("*/*")) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "PVR → PNG（支持批量）",
+                        text = L.s(R.string.b_pvr_png),
                         icon = Icons.Default.Image,
                         onClick = { launchPicker(ConvertMode.PVR_TO_PNG) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "PNG → PVR（选择压缩质量）",
+                        text = L.s(R.string.b_png_pvr),
                         icon = Icons.Default.PhotoLibrary,
                         onClick = { launchPicker(ConvertMode.PNG_TO_PVR) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "DDS → PNG（支持批量）",
+                        text = L.s(R.string.b_dds_png),
                         icon = Icons.Default.Collections,
                         onClick = { launchPicker(ConvertMode.DDS_TO_PNG) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "PNG → DDS（选择压缩格式）",
+                        text = L.s(R.string.b_png_dds),
                         icon = Icons.Default.SaveAlt,
                         onClick = { launchPicker(ConvertMode.PNG_TO_DDS) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "DDS → PVR（跨端移植 PC→安卓）",
+                        text = L.s(R.string.b_dds_pvr),
                         icon = Icons.Default.SwapHoriz,
                         onClick = { launchPicker(ConvertMode.DDS_TO_PVR) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "PVR → DDS（跨端移植 安卓→PC）",
+                        text = L.s(R.string.b_pvr_dds),
                         icon = Icons.Default.SwapVert,
                         onClick = { launchPicker(ConvertMode.PVR_TO_DDS) },
                         enabled = !isProcessing
@@ -794,42 +803,42 @@ fun MainScreen() {
                 }
 
                 // ===== Wwise 音频（语音/音效） =====
-                SectionCard(title = "Wwise 音频（语音/音效）") {
+                SectionCard(title = L.s(R.string.sec_wwise)) {
                     Text(
-                        text = "解包：从 .pck/.bnk 提取 .wem 音频，同选 SoundbanksInfo.json 可还原原始文件名并按原始目录分类，输出按库名分文件夹（同名 pck+bnk 只保留完整版）。\n" +
-                            "打包：选 1 个目标库 + 若干 .wem（同库按 ID 匹配；跨语言语音替换需同选 json 按文件名匹配）；流式库也可把同名 .pck + .bnk 一起选，一次成对重打。输出 *_repacked 文件，改名后放回游戏 WwiseSound 目录即可。\n" +
-                            "bnk 与 pck 的分工：bnk 存事件表和「预取前几 KB」，完整音频在同名 .pck 里流式加载，两者不可互换、必须成对存在。\n" +
-                            "转 OGG：把 .wem 批量转成通用 ogg（PCM/PtADPCM 编码直出 wav），也可直接选 .pck/.bnk 整库转出；\n" +
-                            "OGG 转 WEM：把标准 Vorbis OGG 编码为游戏可用的 .wem（注意包大小上限 32KB，超限请降低质量重编码）；试听：app 内点按播放，列表显示触发事件。",
+                        text = L.s(R.string.t_unpack_help) +
+                            L.s(R.string.t_pack_help) +
+                            L.s(R.string.t_bnk_pck_help) +
+                            L.s(R.string.t_toogg_help) +
+                            L.s(R.string.t_towem_help),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     FunctionButton(
-                        text = "Wwise 解包：PCK/BNK → WEM（支持批量）",
+                        text = L.s(R.string.b_ww_unpack),
                         icon = Icons.Default.GraphicEq,
                         onClick = { launchPicker(ConvertMode.WWISE_UNPACK) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "Wwise 打包：替换 WEM 重建库",
+                        text = L.s(R.string.b_ww_pack),
                         icon = Icons.Default.LibraryMusic,
                         onClick = { launchPicker(ConvertMode.WWISE_PACK) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "WEM 转 OGG：转成通用音频（支持批量/整库）",
+                        text = L.s(R.string.b_wem_ogg),
                         icon = Icons.Default.AudioFile,
                         onClick = { launchPicker(ConvertMode.WWISE_TO_OGG) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "OGG 转 WEM：编码为游戏可用音频（支持批量）",
+                        text = L.s(R.string.b_audio_wem),
                         icon = Icons.Default.Mic,
                         onClick = { launchPicker(ConvertMode.WWISE_TO_WEM) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
-                        text = "WEM 试听：选文件即点即播",
+                        text = L.s(R.string.b_wem_play),
                         icon = Icons.Default.PlayCircle,
                         onClick = { launchPicker(ConvertMode.WWISE_PLAY) },
                         enabled = !isProcessing
@@ -837,90 +846,139 @@ fun MainScreen() {
                 }
 
                 // ===== 使用说明 =====
-                SectionCard(title = "使用说明") {
+                SectionCard(title = L.s(R.string.l_instructions)) {
                     Text(
-                        text = "1. 点击功能按钮，通过系统文件选择器选择文件（支持多选）\n" +
-                               "2. 转换结果保存到导出目录（可在上方修改）\n" +
-                               "3. 同名文件会自动加编号，不会覆盖",
+                        text = L.s(R.string.t_step1) +
+                               L.s(R.string.t_step2) +
+                               L.s(R.string.t_step3),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
-                // ===== 关于 =====
-                SectionCard(title = "关于") {
-                    val context = LocalContext.current
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            text = "DVPL Mod 助手 v" + BuildConfig.VERSION_NAME + "\n为 World of Tanks Blitz 准备的纹理 / DVPL / Wwise 音频转换工具",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Divider()
-                        Text(
-                            text = "Wwise 音频小知识：同名 .bnk 与 .pck 成对存在——bnk 存事件表和每个音源的前几 KB 预取，完整音频在 .pck 里按需流式加载，两者分工不同、不可互换，替换音源时需要分别重打两个文件。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Divider()
-                        Text(
-                            text = "开源仓库",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            text = GITHUB_URL,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary,
-                            textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
-                            modifier = Modifier.clickable {
-                                try {
-                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL)))
-                                } catch (e: Exception) {
-                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("GitHub", GITHUB_URL))
-                                    Toast.makeText(context, "未找到浏览器，链接已复制", Toast.LENGTH_SHORT).show()
-                                }
+                // ===== 设置与关于 =====
+                SectionCard(title = L.s(R.string.l_settings_about)) {
+                    FunctionButton(
+                        text = L.s(R.string.b_open_settings_about),
+                        icon = Icons.Default.Info,
+                        onClick = { showSettingsAbout = true },
+                        enabled = !isProcessing
+                    )
+                }
+            }
+
+
+            // 设置与关于对话框
+            if (showSettingsAbout) {
+                val dialogContext = LocalContext.current
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showSettingsAbout = false },
+                    title = { Text(L.s(R.string.l_settings_about)) },
+                    text = {
+                        Column(
+                            modifier = Modifier.verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(L.s(R.string.l_language), style = MaterialTheme.typography.titleSmall)
+                            for ((code, name) in listOf(
+                                "system" to L.s(R.string.lang_system),
+                                "zh" to "中文",
+                                "en" to "English",
+                                "ru" to "Русский"
+                            )) {
+                                androidx.compose.material3.FilterChip(
+                                    selected = currentLang == code,
+                                    onClick = {
+                                        if (currentLang != code) {
+                                            L.applyLanguage(code)
+                                            currentLang = code
+                                        }
+                                    },
+                                    label = { Text(name) },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
                             }
-                        )
-                        TextButton(onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("GitHub", GITHUB_URL))
-                            Toast.makeText(context, "链接已复制", Toast.LENGTH_SHORT).show()
-                        }) {
-                            Text("复制链接")
-                        }
-                        TextButton(onClick = {
-                            try {
+                            Divider()
+                            Text(L.s(R.string.l_about), style = MaterialTheme.typography.titleSmall)
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                
+                                Text(
+                                text = L.s(R.string.x_version) + BuildConfig.VERSION_NAME + L.s(R.string.t_tagline),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Divider()
+                                Text(
+                                text = L.s(R.string.t_wise_tip),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Divider()
+                                Text(
+                                text = L.s(R.string.l_repo),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                text = GITHUB_URL,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
+                                modifier = Modifier.clickable {
+                                try {
+                                dialogContext.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL)))
+                                } catch (e: Exception) {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("GitHub", GITHUB_URL))
+                                Toast.makeText(context, L.s(R.string.x_no_browser), Toast.LENGTH_SHORT).show()
+                                }
+                                }
+                                )
+                                TextButton(onClick = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("GitHub", GITHUB_URL))
+                                Toast.makeText(context, L.s(R.string.x_link_copied), Toast.LENGTH_SHORT).show()
+                                }) {
+                                Text(L.s(R.string.b_copy_link))
+                                }
+                                TextButton(onClick = {
+                                try {
                                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ISSUES_URL)))
-                            } catch (e: Exception) {
+                                } catch (e: Exception) {
                                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                 cm.setPrimaryClip(ClipData.newPlainText("GitHub Issues", ISSUES_URL))
-                                Toast.makeText(context, "未找到浏览器，链接已复制", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, L.s(R.string.x_no_browser), Toast.LENGTH_SHORT).show()
+                                }
+                                }) {
+                                Text(L.s(R.string.l_feedback))
+                                }
+                                Divider()
+                                Text(
+                                text = L.s(R.string.t_star),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                text = L.s(R.string.t_license) +
+                                L.s(R.string.t_oss_1) +
+                                L.s(R.string.t_oss_2),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                text = L.s(R.string.t_credits),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
-                        }) {
-                            Text("问题反馈（GitHub Issues）")
                         }
-                        Divider()
-                        Text(
-                            text = "如果这个工具帮到了您，欢迎给仓库点一个 ⭐ Star，这是持续更新的动力",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = "本软件以 Apache License 2.0 开源。\n" +
-                                   "内置组件：astcenc（Apache-2.0）、bcdec（MIT）、LZ4（BSD-2-Clause）、" +
-                                   "ww2ogg（BSD，WEM 转 OGG），详见仓库 THIRD_PARTY_NOTICES.md",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = "致谢：DVPL / PVR 格式知识来自 koreanrandom.com 社区（StranikS_Scan）的逆向文档",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showSettingsAbout = false }) {
+                            Text(L.s(R.string.b_close))
+                        }
                     }
-                }
+                )
             }
 
             // 加载中覆盖层
@@ -940,13 +998,14 @@ fun MainScreen() {
                             verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
                             CircularProgressIndicator()
-                            Text(processingStatus.ifEmpty { "处理中..." })
+                            Text(processingStatus.ifEmpty { L.s(R.string.x_processing) })
                         }
                     }
                 }
             }
         }
     }
+    }  // key(currentLang)
 }
 
 /**
@@ -979,7 +1038,7 @@ suspend fun processWwiseBatch(
                 }
             )
         } catch (e: Exception) {
-            android.util.Log.w("Wwise", "SoundbanksInfo 解析失败: " + js.name, e)
+            android.util.Log.w("Wwise", L.s(R.string.e_sbi_parse) + js.name, e)
         }
     }
     val nameMap = info.names
@@ -987,7 +1046,7 @@ suspend fun processWwiseBatch(
     // 模式级预检查失败不抛异常（会穿透协程导致崩溃），统一转为失败记录返回
     try {
     if (mode == ConvertMode.WWISE_UNPACK) {
-        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .pck/.bnk 文件")
+        if (otherSels.isEmpty()) throw IllegalStateException(L.s(R.string.e_no_pck))
         // 预扫描已选 .pck：完整版 id 集 + 库名集合（同名 pck+bnk 成对时 pck 副本优先，
         // bnk 里的截断预取副本跳过，避免出现「同名 (1)」重复文件）
         val bankNameRe = Regex("\\.(pck|bnk)(\\.dvpl)?$", RegexOption.IGNORE_CASE)
@@ -1014,18 +1073,18 @@ suspend fun processWwiseBatch(
                     try {
                         currentCoroutineContext().ensureActive()
                         val input = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
-                            ?: throw IllegalStateException("无法读取文件")
+                            ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                         val wasDvpl = DvplCodec.isDvplFile(input)
                         val data = if (wasDvpl) DvplCodec.decode(input) else input
                         val bank = WwiseConverter.parse(data)
                         if (bank == null) {
                             // 内容嗅探：可能是改名的 json，静默跳过
                             if (data.isNotEmpty() && data[0] == '{'.code.toByte()) {
-                                return@async Triple(sel.name, true, "跳过（JSON 命名源）")
+                                return@async Triple(sel.name, true, L.s(R.string.x_skip_json))
                             }
-                            throw IllegalStateException("不是有效的 PCK/BNK 文件")
+                            throw IllegalStateException(L.s(R.string.e_not_pck))
                         }
-                        if (bank.entries.isEmpty()) throw IllegalStateException("纯事件库（无媒体文件）")
+                        if (bank.entries.isEmpty()) throw IllegalStateException(L.s(R.string.x_event_only))
                         val stem = stemOf(sel.name)
                         var extracted = 0
                         var deduped = 0
@@ -1050,11 +1109,11 @@ suspend fun processWwiseBatch(
                         }
                         val named = bank.entries.count { nameMap.containsKey(it.id) }
                         val notes = ArrayList<String>()
-                        if (named > 0) notes.add("$named 个已按原始目录命名")
-                        else notes.add("未加载 SoundbanksInfo，仅数字 ID 命名")
-                        if (deduped > 0) notes.add("$deduped 个截断预取与所选 .pck 重复已跳过")
-                        if (truncWarn > 0) notes.add("警告：$truncWarn 个流式音频为截断预取（不完整），完整音频在同名 .pck，建议同选")
-                        Triple(sel.name, true, "提取 " + extracted + " 个 wem（" + notes.joinToString("；") + "）")
+                        if (named > 0) notes.add(L.s(R.string.tpl_named_count, named))
+                        else notes.add(L.s(R.string.x_no_sbi))
+                        if (deduped > 0) notes.add(L.s(R.string.tpl_dedup_skip, deduped))
+                        if (truncWarn > 0) notes.add(L.s(R.string.tpl_trunc_warn, truncWarn))
+                        Triple(sel.name, true, L.s(R.string.x_extract_prefix) + extracted + L.s(R.string.x_wem_suffix) + notes.joinToString("；") + "）")
                     } catch (e: Exception) {
                         if (e is kotlinx.coroutines.CancellationException) throw e
                         android.util.Log.e("WwiseUnpack", "FAIL: " + fName, e)
@@ -1065,11 +1124,11 @@ suspend fun processWwiseBatch(
         }
     } else if (mode == ConvertMode.WWISE_TO_OGG) {
         // ===== WWISE_TO_OGG：wem → ogg（Vorbis）或 wav（PCM）；也支持 .pck/.bnk 整库直转 =====
-        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .wem 或 .pck/.bnk 文件")
+        if (otherSels.isEmpty()) throw IllegalStateException(L.s(R.string.e_no_wem_pck))
         val bankNameRe = Regex("\\.(pck|bnk)(\\.dvpl)?$", RegexOption.IGNORE_CASE)
         val bad = otherSels.filterNot { it.name.endsWith(".wem", true) || bankNameRe.containsMatchIn(it.name) }
-        if (bad.isNotEmpty()) throw IllegalStateException("不支持的文件：" + bad.first().name +
-            "（本模式支持 .wem 单文件或 .pck/.bnk 整库）")
+        if (bad.isNotEmpty()) throw IllegalStateException(L.s(R.string.e_unsupported_file) + bad.first().name +
+            L.s(R.string.x_mode_supports))
         fun stemOf(name: String): String {
             var s = name
             if (s.endsWith(".dvpl", true)) s = s.dropLast(5)
@@ -1086,10 +1145,10 @@ suspend fun processWwiseBatch(
                         if (!isBank) {
                             // ---- 单个 .wem ----
                             val wemBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
-                                ?: throw IllegalStateException("无法读取文件")
+                                ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                             if (WwiseConverter.isTruncatedWem(wemBytes))
                                 throw IllegalStateException(
-                                    "该 wem 是流式截断预取（不完整）——完整音频在同名 .pck 中，请改选 .pck 整库转换")
+                                    L.s(R.string.e_trunc_prefetch))
                             val id = WwiseConverter.parseWemFileName(sel.name).first
                             val origName = id?.let { nameMap[it] }
                             val baseName = origName ?: sel.name.removeSuffix(".wem").removeSuffix(".WEM")
@@ -1103,41 +1162,41 @@ suspend fun processWwiseBatch(
                                 val outName = makeUniqueSafeName(baseName, "wav")
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
                                 else saveToDownloads(context, outName, wemBytes, subDir)
-                                listOf(Triple(sel.name, true, "PCM 直出 WAV"))
+                                listOf(Triple(sel.name, true, L.s(R.string.x_pcm_wav)))
                             } else if (WwiseConverter.isPtAdpcmWem(wemBytes)) {
                                 val wavBytes = WwiseConverter.decodePtAdpcmToWav(wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "wav")
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
                                 else saveToDownloads(context, outName, wavBytes, subDir)
-                                listOf(Triple(sel.name, true, "PtADPCM 解码 WAV"))
+                                listOf(Triple(sel.name, true, L.s(R.string.x_ptadpcm_wav)))
                             } else if (WwiseConverter.isImaAdpcmWem(wemBytes)) {
                                 val wavBytes = WwiseConverter.decodeImaAdpcmToWav(wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "wav")
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
                                 else saveToDownloads(context, outName, wavBytes, subDir)
-                                listOf(Triple(sel.name, true, "IMA ADPCM 解码 WAV"))
+                                listOf(Triple(sel.name, true, L.s(R.string.x_ima_wav)))
                             } else if (WwiseConverter.isOpusWem(wemBytes)) {
                                 val wavBytes = WwiseConverter.decodeOpusToWav(wemBytes, context)
                                 val outName = makeUniqueSafeName(baseName, "wav")
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
                                 else saveToDownloads(context, outName, wavBytes, subDir)
-                                listOf(Triple(sel.name, true, "Opus 解码 WAV"))
+                                listOf(Triple(sel.name, true, L.s(R.string.x_opus_wav)))
                             } else {
                                 val oggBytes = WwiseNative.convertWemToOgg(context, wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "ogg")
                                 if (dirUri != null) saveToDir(context, dirUri, outName, oggBytes, subDir)
                                 else saveToDownloads(context, outName, oggBytes, subDir)
-                                listOf(Triple(sel.name, true, "已转换 OGG"))
+                                listOf(Triple(sel.name, true, L.s(R.string.x_converted_ogg)))
                             }
                         } else {
                             // ---- .pck/.bnk 整库直转 ----
                             val input = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
-                                ?: throw IllegalStateException("无法读取文件")
+                                ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                             val data = if (DvplCodec.isDvplFile(input)) DvplCodec.decode(input) else input
                             val bank = WwiseConverter.parse(data)
-                                ?: throw IllegalStateException("不是有效的 PCK/BNK 文件")
+                                ?: throw IllegalStateException(L.s(R.string.e_not_pck))
                             if (bank.entries.isEmpty())
-                                return@async listOf(Triple(sel.name, true, "跳过：纯事件库（无媒体文件）"))
+                                return@async listOf(Triple(sel.name, true, L.s(R.string.x_skip_event_only)))
                             val stem = stemOf(sel.name)
                             var ok = 0
                             var oggN = 0
@@ -1198,9 +1257,9 @@ suspend fun processWwiseBatch(
                                 }
                             }
                             val notes = ArrayList<String>()
-                            notes.add("转出 OGG " + oggN + " 个 / WAV " + wavN + " 个（输出到 " + mode.subDirName + "/" + stem + "/）")
-                            if (skipped > 0) notes.add("跳过 " + skipped + " 个截断预取（完整音频在同名 .pck，请改选 .pck）")
-                            if (failed > 0) notes.add("失败 " + failed + " 个：" + firstErr)
+                            notes.add(L.s(R.string.x_ogg_out_prefix) + oggN + L.s(R.string.x_ogg_out_mid) + wavN + L.s(R.string.x_ogg_out_suffix) + mode.subDirName + "/" + stem + "/）")
+                            if (skipped > 0) notes.add(L.s(R.string.x_skip_prefix) + skipped + L.s(R.string.x_trunc_skip_suffix))
+                            if (failed > 0) notes.add(L.s(R.string.x_fail_prefix) + failed + L.s(R.string.x_fail_suffix) + firstErr)
                             listOf(Triple(sel.name, ok > 0, notes.joinToString("；")))
                         }
                     } catch (e: Exception) {
@@ -1212,10 +1271,17 @@ suspend fun processWwiseBatch(
             }.awaitAll().flatten()
         }
     } else if (mode == ConvertMode.WWISE_TO_WEM) {
-        // ===== WWISE_TO_WEM：ogg → wem（Wwise Vorbis，内联完整码书） =====
-        if (otherSels.isEmpty()) throw IllegalStateException("未选择 .ogg 文件")
-        val bad = otherSels.filterNot { it.name.endsWith(".ogg", ignoreCase = true) }
-        if (bad.isNotEmpty()) throw IllegalStateException("不支持的文件：" + bad.first().name)
+        // ===== WWISE_TO_WEM：音频 → wem（支持 WAV/OGG/MP3/M4A/FLAC 等；内置 libvorbis 编码） =====
+        if (otherSels.isEmpty()) throw IllegalStateException(L.s(R.string.e_no_audio))
+        val supportedExts = setOf("wav", "ogg", "mp3", "m4a", "aac", "flac", "opus")
+        val bad = otherSels.filterNot { sel ->
+            val ext = sel.name.substringAfterLast('.', "").lowercase()
+            ext in supportedExts
+        }
+        if (bad.isNotEmpty()) throw IllegalStateException(L.s(R.string.e_unsupported_audio_type) + bad.first().name +
+            L.s(R.string.x_audio_formats))
+        // 码书库只读一次，所有协程共用同一份字节
+        val packedCodebooks = WwiseNative.codebookFile(context).readBytes()
         val dispatcher = Dispatchers.IO.limitedParallelism(4)
         kotlinx.coroutines.coroutineScope {
             otherSels.map { sel ->
@@ -1223,27 +1289,32 @@ suspend fun processWwiseBatch(
                     var fName = sel.name
                     try {
                         currentCoroutineContext().ensureActive()
-                        val oggBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
-                            ?: throw IllegalStateException("无法读取文件")
-                        if (oggBytes.size < 4 || String(oggBytes, 0, 4, Charsets.US_ASCII) != "OggS")
-                            throw IllegalArgumentException("不是有效的 OGG 文件")
-                        val wemBytes = WwiseConverter.oggToWem(oggBytes)
-                        // 结构自检（chunk 表 + 包链 + 码书同步），失败不落盘
+                        val inputBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
+                            ?: throw IllegalStateException(L.s(R.string.e_cant_read))
+
+                        // 统一解码为 PCM 再用内置 aoTuV b6.03 编码为 OGG：
+                        // 外部 OGG（ffmpeg/标准 libvorbis）的码书与 Wwise 库不一致，必须重编码
+                        val pcmResult = decodeToPcm(context, sel.uri)
+                        val oggBytes: ByteArray = WwiseNative.pcmToOgg(
+                            pcmResult.pcm, pcmResult.sampleRate, pcmResult.channels
+                        ) ?: throw IllegalStateException(L.s(R.string.e_vorbis_enc))
+
+                        val wemBytes = WwiseConverter.oggToWem(oggBytes, packedCodebooks)
                         val problem = WwiseConverter.validateWemStructure(wemBytes)
-                        if (problem != null) throw IllegalStateException("编码结果自检失败：" + problem)
-                        val baseName = sel.name.removeSuffix(".ogg").removeSuffix(".OGG")
+                        if (problem != null) throw IllegalStateException(L.s(R.string.e_selfcheck) + problem)
+                        val baseName = sel.name.substringBeforeLast('.')
                         val outName = makeUniqueSafeName(baseName, "wem")
                         val subDir = if (groupByType) mode.subDirName else null
                         if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
                         else saveToDownloads(context, outName, wemBytes, subDir)
                         val samples = WwiseConverter.readWemSampleCount(wemBytes)
                         val rate = WwiseConverter.readWemSampleRate(wemBytes)
-                        val dur = if (samples > 0 && rate > 0) String.format("%.1f 秒", samples.toDouble() / rate) else ""
-                        Triple(sel.name, true, "已转换 WEM（" + wemBytes.size + "B" +
+                        val dur = if (samples > 0 && rate > 0) String.format(L.s(R.string.fmt_seconds), samples.toDouble() / rate) else ""
+                        Triple(sel.name, true, L.s(R.string.x_wem_done) + wemBytes.size + "B" +
                             (if (dur.isNotEmpty()) "，" + dur else "") + "）")
                     } catch (e: Exception) {
                         if (e is kotlinx.coroutines.CancellationException) throw e
-                        android.util.Log.e("OggWem", "FAIL: " + fName, e)
+                        android.util.Log.e("AudioToWem", "FAIL: " + fName, e)
                         Triple(fName, false, e.message ?: e.javaClass.simpleName)
                     }
                 }
@@ -1255,8 +1326,8 @@ suspend fun processWwiseBatch(
         val banks = otherSels.filter { bankRe.containsMatchIn(it.name) }
         val wems = otherSels.filter { it.name.endsWith(".wem", ignoreCase = true) }
         val unknown = otherSels.filterNot { bankRe.containsMatchIn(it.name) || it.name.endsWith(".wem", ignoreCase = true) }
-        if (unknown.isNotEmpty()) throw IllegalStateException("无法识别的文件：" + unknown.first().name)
-        if (wems.isEmpty()) throw IllegalStateException("未选择 .wem 替换文件")
+        if (unknown.isNotEmpty()) throw IllegalStateException(L.s(R.string.e_unknown_file) + unknown.first().name)
+        if (wems.isEmpty()) throw IllegalStateException(L.s(R.string.e_no_replacement))
 
         // 去掉 .pck/.bnk 与 .dvpl 后缀取同名主干，用于成对校验
         fun stemOf2(n: String): String {
@@ -1270,16 +1341,16 @@ suspend fun processWwiseBatch(
             val p = banks.firstOrNull { stemOf2(it.name) != it.name && it.name.removeSuffix(".dvpl").endsWith(".pck", true) }
             val b = banks.firstOrNull { stemOf2(it.name) != it.name && it.name.removeSuffix(".dvpl").endsWith(".bnk", true) }
             if (p == null || b == null || stemOf2(p.name) != stemOf2(b.name))
-                throw IllegalStateException("选择了 2 个目标库：仅支持同名的 .pck + .bnk 成对重打（把两个库和同一批 wem 一起选即可）")
+                throw IllegalStateException(L.s(R.string.e_two_banks))
         } else if (banks.size != 1) {
-            throw IllegalStateException("需要选择 1 个 .pck/.bnk 目标库，或同名的 .pck + .bnk 一对（当前 " + banks.size + " 个）")
+            throw IllegalStateException(L.s(R.string.e_need_bank) + banks.size + L.s(R.string.x_detail_suffix))
         }
         val pairMode = banks.size == 2
 
         // 预读全部 wem（成对模式两个库都要用）
         val wemFiles = wems.map { w ->
             val bytes = context.contentResolver.openInputStream(w.uri)?.use { it.readBytes() }
-                ?: throw IllegalStateException("无法读取 " + w.name)
+                ?: throw IllegalStateException(L.s(R.string.e_cant_read_name) + w.name)
             w.name to bytes
         }
 
@@ -1288,11 +1359,11 @@ suspend fun processWwiseBatch(
             try {
                 currentCoroutineContext().ensureActive()
                 val input = context.contentResolver.openInputStream(bankSel.uri)?.use { it.readBytes() }
-                    ?: throw IllegalStateException("无法读取文件")
+                    ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                 val wasDvpl = DvplCodec.isDvplFile(input)
                 val data = if (wasDvpl) DvplCodec.decode(input) else input
                 val bank = WwiseConverter.parse(data)
-                    ?: throw IllegalStateException("不是有效的 PCK/BNK 文件")
+                    ?: throw IllegalStateException(L.s(R.string.e_not_pck))
 
                 // 目标库的 名称 → id 反查表（需 json 提供名称；同库替换走 id 直配，不依赖 json）
                 val idSet = bank.entries.map { it.id }.toHashSet()
@@ -1315,13 +1386,13 @@ suspend fun processWwiseBatch(
                     else replacements[targetId] = wemBytes
                 }
                 if (!pairMode && unmatched.isNotEmpty()) {
-                    throw IllegalStateException("以下 wem 未匹配到目标库条目（跨语言替换请同选 SoundbanksInfo.json）：" +
-                        unmatched.take(3).joinToString() + (if (unmatched.size > 3) " 等 " + unmatched.size + " 个" else ""))
+                    throw IllegalStateException(L.s(R.string.x_unmatched) +
+                        unmatched.take(3).joinToString() + (if (unmatched.size > 3) L.s(R.string.x_and_more) + unmatched.size + L.s(R.string.x_unit_suffix) else ""))
                 }
                 if (replacements.isEmpty()) {
                     return@map listOf(Triple(fName, false,
-                        if (pairMode) "该库没有匹配的 wem 条目（pck/bnk 条目本就不同，另一库应已处理），未输出文件"
-                        else "没有匹配的 wem 条目"))
+                        if (pairMode) L.s(R.string.x_no_match_pckbnk)
+                        else L.s(R.string.x_no_match)))
                 }
 
                 val repacked = WwiseConverter.repack(bank, replacements)
@@ -1336,12 +1407,12 @@ suspend fun processWwiseBatch(
                 val savedPath = if (dirUri != null) saveToDir(context, dirUri, outName, outData, subDir)
                 else saveToDownloads(context, outName, outData, subDir)
                 val notes = ArrayList<String>()
-                notes.add("替换 " + replacements.size + " 个 wem → " + savedPath)
+                notes.add(L.s(R.string.x_replaced_prefix) + replacements.size + L.s(R.string.x_replaced_suffix) + savedPath)
                 if (pairMode && unmatched.isNotEmpty())
-                    notes.add("跳过 " + unmatched.size + " 个不属于该库的 wem（pck/bnk 条目本就不同，成对时属正常）")
+                    notes.add(L.s(R.string.x_skip_prefix) + unmatched.size + L.s(R.string.x_skipped_foreign))
                 if (repacked.truncatedReplacements > 0)
-                    notes.add("其中 " + repacked.truncatedReplacements + " 个流式条目已按原库截断为预取前缀" +
-                        (if (!isPckName && !pairMode) "：请再用同一批 wem 重打同名 .pck" else ""))
+                    notes.add(L.s(R.string.x_of_which) + repacked.truncatedReplacements + L.s(R.string.x_truncated_prefix) +
+                        (if (!isPckName && !pairMode) L.s(R.string.x_truncated_hint) else ""))
                 listOf(Triple(fName, true, notes.joinToString("；")))
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
@@ -1354,16 +1425,118 @@ suspend fun processWwiseBatch(
         // 模式级预检查失败（选错文件类型/数量等）：转为失败记录，不再穿透协程导致应用崩溃
         if (e is kotlinx.coroutines.CancellationException) throw e
         android.util.Log.e("Wwise", "MODE FAIL: " + e.message, e)
-        val modeLabel = when (mode) {
-            ConvertMode.WWISE_UNPACK -> "解包"
-            ConvertMode.WWISE_PACK -> "打包"
-            ConvertMode.WWISE_TO_OGG -> "转OGG"
-            ConvertMode.WWISE_TO_WEM -> "转WEM"
-            else -> "试听"
-        }
+        val modeLabel = L.s(mode.titleRes)
         listOf(Triple("Wwise " + modeLabel,
             false, e.message ?: e.javaClass.simpleName))
     }
+}
+
+/** MediaExtractor 解码结果：16-bit LE interleaved PCM */
+private data class PcmResult(val pcm: ByteArray, val sampleRate: Int, val channels: Int)
+
+/**
+ * 用 Android MediaExtractor + MediaCodec 把任意音频 Uri 解码为 16-bit LE PCM。
+ * 支持 WAV/MP3/M4A/AAC/FLAC/OPUS 等所有系统解码器支持的格式。
+ */
+private fun decodeToPcm(context: android.content.Context, uri: android.net.Uri): PcmResult {
+    val extractor = android.media.MediaExtractor()
+    extractor.setDataSource(context, uri, null)
+
+    // 找音频轨
+    var trackIndex = -1
+    var format: android.media.MediaFormat? = null
+    for (i in 0 until extractor.trackCount) {
+        val fmt = extractor.getTrackFormat(i)
+        val mime = fmt.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+        if (mime.startsWith("audio/")) {
+            trackIndex = i
+            format = fmt
+            break
+        }
+    }
+    if (trackIndex < 0 || format == null) {
+        extractor.release()
+        throw IllegalArgumentException(L.s(R.string.e_no_audio_track))
+    }
+
+    val mime = format.getString(android.media.MediaFormat.KEY_MIME)!!
+    val sampleRate = format.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
+    val channels = format.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
+
+    extractor.selectTrack(trackIndex)
+
+    val codec = android.media.MediaCodec.createDecoderByType(mime)
+    codec.configure(format, null, null, 0)
+    codec.start()
+
+    val out = java.io.ByteArrayOutputStream()
+    val timeoutUs = 10_000L
+    var inputDone = false
+    var outputDone = false
+    var outputFormat: android.media.MediaFormat? = null
+
+    try {
+        while (!outputDone) {
+            if (!inputDone) {
+                val inIdx = codec.dequeueInputBuffer(timeoutUs)
+                if (inIdx >= 0) {
+                    val buf = codec.getInputBuffer(inIdx)!!
+                    val sz = extractor.readSampleData(buf, 0)
+                    if (sz < 0) {
+                        codec.queueInputBuffer(inIdx, 0, 0, 0,
+                            android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    } else {
+                        codec.queueInputBuffer(inIdx, 0, sz, extractor.sampleTime, 0)
+                        extractor.advance()
+                    }
+                }
+            }
+            val info = android.media.MediaCodec.BufferInfo()
+            val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
+            if (outIdx == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                outputFormat = codec.outputFormat
+            } else if (outIdx >= 0) {
+                if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
+                    outputDone = true
+                val buf = codec.getOutputBuffer(outIdx)!!
+                val bytes = ByteArray(info.size)
+                buf.get(bytes)
+                out.write(bytes)
+                codec.releaseOutputBuffer(outIdx, false)
+            }
+        }
+    } finally {
+        codec.stop()
+        codec.release()
+        extractor.release()
+    }
+
+    var rawPcm = out.toByteArray()
+    if (rawPcm.isEmpty()) throw IllegalStateException(L.s(R.string.e_empty_decode))
+
+    // 检查实际输出编码格式：Android 部分设备/格式（FLAC、高采样率）会输出 float32
+    val pcmEncoding = outputFormat?.let {
+        if (it.containsKey(android.media.MediaFormat.KEY_PCM_ENCODING))
+            it.getInteger(android.media.MediaFormat.KEY_PCM_ENCODING)
+        else android.media.AudioFormat.ENCODING_PCM_16BIT
+    } ?: android.media.AudioFormat.ENCODING_PCM_16BIT
+
+    val pcm16: ByteArray = if (pcmEncoding == android.media.AudioFormat.ENCODING_PCM_FLOAT) {
+        // float32 LE → int16 LE
+        val floatBuf = java.nio.ByteBuffer.wrap(rawPcm).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val out16 = java.nio.ByteBuffer.allocate(rawPcm.size / 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val shortBuf = out16.asShortBuffer()
+        while (floatBuf.hasRemaining()) {
+            val f = floatBuf.get().coerceIn(-1f, 1f)
+            shortBuf.put((f * 32767f).toInt().toShort())
+        }
+        out16.array()
+    } else {
+        rawPcm
+    }
+
+    return PcmResult(pcm16, sampleRate, channels)
 }
 
 /** wem 转换输出名：{安全基名}.{ext}（基名去掉原扩展，替换非法字符） */
@@ -1450,22 +1623,22 @@ internal fun saveToDir(
     subDir: String? = null
 ): String {
     var dir = DocumentFile.fromTreeUri(context, dirUri)
-        ?: throw IllegalStateException("无法访问导出目录，请重新设置")
+        ?: throw IllegalStateException(L.s(R.string.e_no_export_access))
     if (!dir.isDirectory || !dir.canWrite()) {
-        throw IllegalStateException("导出目录不可写，请重新设置")
+        throw IllegalStateException(L.s(R.string.e_export_readonly))
     }
     if (subDir != null) {
         // 支持嵌套子目录（Wwise 按原始路径分类：Tracks/loops 等），逐级创建
         for (seg in subDir.split('/').filter { it.isNotBlank() }) {
             dir = dir.findFile(seg)?.takeIf { it.isDirectory } ?: dir.createDirectory(seg)
-                ?: throw IllegalStateException("无法创建分类子目录：" + seg)
+                ?: throw IllegalStateException(L.s(R.string.e_mkdir) + seg)
         }
     }
     val uniqueName = makeUniqueFileName(dir, fileName)
     val file = dir.createFile("application/octet-stream", uniqueName)
-        ?: throw IllegalStateException("无法在导出目录创建文件")
+        ?: throw IllegalStateException(L.s(R.string.e_create_file))
     context.contentResolver.openOutputStream(file.uri)?.use { it.write(data) }
-        ?: throw IllegalStateException("无法写入文件")
+        ?: throw IllegalStateException(L.s(R.string.e_write_file))
     return uniqueName
 }
 
@@ -1522,10 +1695,10 @@ internal fun saveToDownloads(
         }
         val uri = context.contentResolver.insert(
             android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
-        ) ?: throw IllegalStateException("无法创建输出文件")
+        ) ?: throw IllegalStateException(L.s(R.string.e_output_file))
         try {
             context.contentResolver.openOutputStream(uri)?.use { it.write(data) }
-                ?: throw IllegalStateException("无法写入文件")
+                ?: throw IllegalStateException(L.s(R.string.e_write_file))
             values.clear()
             values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
             context.contentResolver.update(uri, values, null, null)
@@ -1568,14 +1741,14 @@ fun WelcomeCard() {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "DVPL Mod 工具",
+                text = L.s(R.string.app_welcome),
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onPrimaryContainer
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "为 World of Tanks Blitz 准备的文件转换工具",
+                text = L.s(R.string.app_subtitle),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onPrimaryContainer
             )

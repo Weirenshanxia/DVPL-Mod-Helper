@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.ui
 
 import android.media.MediaPlayer
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -94,11 +96,11 @@ fun WemPlayerScreen(
                 val (uri, _) = wemFiles[index]
                 val target = converted[uri] ?: withContext(Dispatchers.IO) {
                     val wemBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: throw IllegalStateException("无法读取文件")
+                        ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                     // 流式截断预取检测：bnk 里只存了前几 KB，转出来只有开头一瞬
                     if (WwiseConverter.isTruncatedWem(wemBytes)) {
                         throw IllegalStateException(
-                            "该 wem 是流式截断预取（不完整）——完整音频在同名 .pck 中，请从 .pck 解包后再试听")
+                            L.s(R.string.e_trunc_listen))
                     }
                     if (WwiseConverter.isPcmWem(wemBytes)) {
                         File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wemBytes) }
@@ -126,7 +128,7 @@ fun WemPlayerScreen(
                 mediaPlayer = mp
                 playingIndex = index
             } catch (e: Exception) {
-                playError = "播放失败：" + (e.message ?: e.javaClass.simpleName)
+                playError = L.s(R.string.x_play_fail) + (e.message ?: e.javaClass.simpleName)
             } finally {
                 convertingIndex = null
             }
@@ -141,13 +143,13 @@ fun WemPlayerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("WEM 试听（${wemFiles.size}）") },
+                title = { Text(L.s(R.string.tpl_wem_title, wemFiles.size)) },
                 navigationIcon = {
                     IconButton(onClick = {
                         stopPlayback()
                         onBack()
                     }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "返回")
+                        Icon(Icons.Default.ArrowBack, contentDescription = L.s(R.string.b_back))
                     }
                 }
             )
@@ -161,13 +163,13 @@ fun WemPlayerScreen(
         ) {
             if (wemFiles.isEmpty()) {
                 Text(
-                    text = "未选择 .wem 文件（可同时选择 SoundbanksInfo.json 显示原始文件名与触发事件）",
+                    text = L.s(R.string.x_pick_wem),
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(vertical = 24.dp)
                 )
             } else {
                 Text(
-                    text = "点按播放 / 再点停止" + (if (jsonFiles.isNotEmpty()) "；事件名来自 SoundbanksInfo" else "；同选 SoundbanksInfo.json 可显示原始文件名与触发事件"),
+                    text = L.s(R.string.x_tap_play) + (if (jsonFiles.isNotEmpty()) L.s(R.string.x_events_from_sbi) else L.s(R.string.x_sbi_hint)),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 8.dp)
@@ -180,7 +182,7 @@ fun WemPlayerScreen(
                         .padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("音量", style = MaterialTheme.typography.bodySmall)
+                    Text(L.s(R.string.l_volume), style = MaterialTheme.typography.bodySmall)
                     Slider(
                         value = volume,
                         onValueChange = { v ->
@@ -260,8 +262,8 @@ fun WemPlayerScreen(
                                 }
                                 events?.takeIf { it.isNotEmpty() }?.let { evs ->
                                     Text(
-                                        text = "事件：" + evs.take(3).joinToString("、") +
-                                            (if (evs.size > 3) " 等${evs.size}个" else ""),
+                                        text = L.s(R.string.l_events) + evs.take(3).joinToString("、") +
+                                            (if (evs.size > 3) L.s(R.string.tpl_and_n_events, evs.size) else ""),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         maxLines = 2,
@@ -279,7 +281,7 @@ fun WemPlayerScreen(
                                     Icon(
                                         imageVector = if (isPlaying) Icons.Default.Stop
                                         else Icons.Default.PlayArrow,
-                                        contentDescription = if (isPlaying) "停止" else "播放"
+                                        contentDescription = if (isPlaying) L.s(R.string.b_stop) else L.s(R.string.b_play)
                                     )
                                 }
                             }

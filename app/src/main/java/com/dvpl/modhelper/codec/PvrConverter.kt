@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.codec
 
 import android.graphics.Bitmap
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 
 /**
  * PVR 纹理转换器
@@ -25,14 +27,14 @@ object PvrConverter {
     )
 
     /** ASTC 质量档位 */
-    enum class AstcQuality(val blockW: Int, val blockH: Int, val label: String) {
-        ASTC_4x4(4, 4, "ASTC 4x4（最高质量）"),
-        ASTC_5x5(5, 5, "ASTC 5x5（高质量）"),
-        ASTC_6x6(6, 6, "ASTC 6x6（推荐/游戏默认）"),
-        ASTC_8x6(8, 6, "ASTC 8x6（中质量）"),
-        ASTC_10x5(10, 5, "ASTC 10x5（小体积）"),
-        RGBA_8888(0, 0, "不压缩 RGBA8888（无损）"),
-        RGBA_4444_PC(0, 0, "RGBA4444（PC 端 DX11 格式）")
+    enum class AstcQuality(val blockW: Int, val blockH: Int, @androidx.annotation.StringRes val labelRes: Int) {
+        ASTC_4x4(4, 4, R.string.astc_4x4),
+        ASTC_5x5(5, 5, R.string.astc_5x5),
+        ASTC_6x6(6, 6, R.string.astc_6x6),
+        ASTC_8x6(8, 6, R.string.astc_8x6),
+        ASTC_10x5(10, 5, R.string.astc_10x5),
+        RGBA_8888(0, 0, R.string.fmt_rgba8888),
+        RGBA_4444_PC(0, 0, R.string.fmt_rgba4444)
     }
 
     // ===== JNI 声明 =====
@@ -66,7 +68,7 @@ object PvrConverter {
             ((data[17].toInt() and 0xFF) shl 8) or
             ((data[18].toInt() and 0xFF) shl 16) or
             ((data[19].toInt() and 0xFF) shl 24)
-        return if (cs == 1) "sRGB" else "线性"
+        return if (cs == 1) "sRGB" else L.s(R.string.l_linear)
     }
 
     /**
@@ -114,7 +116,7 @@ object PvrConverter {
 
         // 大图防线：超过 4096x4096 直接拒绝（游戏也不支持，避免 OOM 闪退）
         if (w > 4096 || h > 4096) {
-            throw IllegalArgumentException("图片 ${w}x${h} 过大（上限 4096x4096），请先缩小")
+            throw IllegalArgumentException(L.s(R.string.tpl_img_4096, w, h))
         }
 
         // 计算 mip 级数（到 1x1）
@@ -184,7 +186,7 @@ object PvrConverter {
                 val pixels = maxPixels!!
                 curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
                 val compressed = nativeAstcEncode(pixels, curW, curH, bw, bh, 0)
-                    ?: throw IllegalStateException("ASTC 编码失败（${curW}x${curH}）")
+                    ?: throw IllegalStateException(L.s(R.string.tpl_astc_fail, curW, curH))
                 crc.update(compressed)
                 out.write(compressed)
             } else if (is4444) {

@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.codec
 
 import android.graphics.Bitmap
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 
 /**
  * DDS 纹理转换器
@@ -26,12 +28,12 @@ object DdsConverter {
         FORMAT_BC1 -> "BC1 (DXT1)"
         FORMAT_BC2 -> "BC2 (DXT3)"
         FORMAT_BC3 -> "BC3 (DXT5)"
-        FORMAT_BC4 -> "BC4 (单通道)"
-        FORMAT_BC5 -> "BC5 (双通道)"
+        FORMAT_BC4 -> L.s(R.string.fmt_bc4)
+        FORMAT_BC5 -> L.s(R.string.fmt_bc5)
         FORMAT_BC6H -> "BC6H (HDR)"
         FORMAT_BC7 -> "BC7"
-        FORMAT_UNCOMPRESSED -> "未压缩"
-        else -> "未知($format)"
+        FORMAT_UNCOMPRESSED -> L.s(R.string.fmt_uncompressed)
+        else -> L.s(R.string.tpl_unknown_fmt, format)
     }
 
     private external fun nativeDecodeDds(ddsData: ByteArray): IntArray?
@@ -92,21 +94,21 @@ object DdsConverter {
         if (data.size < 88) return ""
         val fourCC = (data[84].toInt() and 0xFF) or ((data[85].toInt() and 0xFF) shl 8) or
             ((data[86].toInt() and 0xFF) shl 16) or ((data[87].toInt() and 0xFF) shl 24)
-        if (fourCC != 0x30315844) return "线性"  // not "DX10" -> old DXT5, no sRGB flag
+        if (fourCC != 0x30315844) return L.s(R.string.l_linear)  // not "DX10" -> old DXT5, no sRGB flag
         // DX10 header at offset 128, DXGI format is first u32
         if (data.size < 132) return ""
         val dxgi = (data[128].toInt() and 0xFF) or ((data[129].toInt() and 0xFF) shl 8) or
             ((data[130].toInt() and 0xFF) shl 16) or ((data[131].toInt() and 0xFF) shl 24)
         // sRGB variants: 72=BC1_UNORM_SRGB, 74=BC2_UNORM_SRGB, 78=BC3_UNORM_SRGB,
         //                91=BC6H_UF16(HDR), 99=BC7_UNORM_SRGB
-        return if (dxgi in setOf(72, 74, 78, 99)) "sRGB" else "线性"
+        return if (dxgi in setOf(72, 74, 78, 99)) "sRGB" else L.s(R.string.l_linear)
     }
 
     /** DDS 输出格式 */
-    enum class DdsFormat(val label: String) {
-        BC3("BC3 / DXT5（标准，支持透明）"),
-        BC5("BC5（法线图专用）"),
-        BC4("BC4（单通道灰度）")
+    enum class DdsFormat(@androidx.annotation.StringRes val labelRes: Int) {
+        BC3(R.string.fmt_bc3),
+        BC5(R.string.fmt_bc5_normal),
+        BC4(R.string.fmt_bc4_gray)
     }
 
     /**

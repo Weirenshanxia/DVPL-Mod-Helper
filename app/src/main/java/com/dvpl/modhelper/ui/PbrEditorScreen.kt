@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.ui
 
 import android.graphics.Bitmap
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.compose.foundation.Image
@@ -28,25 +30,25 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** 编辑操作类型 */
-enum class PbrOp(val label: String) {
-    COLOR("调色（颜色贴图）"),
-    GLOSS("光泽/金属度（RM）"),
-    NORMAL("法线生成（颜色图→NM）"),
-    CHANNEL("通道工具")
+enum class PbrOp(@androidx.annotation.StringRes val labelRes: Int) {
+    COLOR(R.string.pbr_color),
+    GLOSS(R.string.pbr_rm),
+    NORMAL(R.string.pbr_normal),
+    CHANNEL(R.string.pbr_channel)
 }
 
 /** 导出格式（PVR 系列 + DDS 系列） */
-enum class PbrExportFormat(val label: String, val isDds: Boolean, val is4444: Boolean) {
-    ASTC_4x4("ASTC 4x4（最高质量）", false, false),
-    ASTC_5x5("ASTC 5x5（高质量）", false, false),
-    ASTC_6x6("ASTC 6x6（推荐/游戏默认）", false, false),
-    ASTC_8x6("ASTC 8x6（中质量）", false, false),
-    ASTC_10x5("ASTC 10x5（小体积）", false, false),
-    RGBA_8888("不压缩 RGBA8888（无损）", false, false),
-    RGBA_4444("RGBA4444（PC DX11 格式）", false, true),
-    BC3("BC3 / DXT5（PC 标准）", true, false),
-    BC4("BC4（单通道灰度，PC）", true, false),
-    BC5("BC5（法线图专用，PC）", true, false);
+enum class PbrExportFormat(@androidx.annotation.StringRes val labelRes: Int, val isDds: Boolean, val is4444: Boolean) {
+    ASTC_4x4(R.string.astc_4x4, false, false),
+    ASTC_5x5(R.string.astc_5x5, false, false),
+    ASTC_6x6(R.string.astc_6x6, false, false),
+    ASTC_8x6(R.string.astc_8x6, false, false),
+    ASTC_10x5(R.string.astc_10x5, false, false),
+    RGBA_8888(R.string.fmt_rgba8888, false, false),
+    RGBA_4444(R.string.fmt_rgba4444_pc, false, true),
+    BC3(R.string.fmt_bc3_pc, true, false),
+    BC4(R.string.fmt_bc4_pc, true, false),
+    BC5(R.string.fmt_bc5_pc, true, false);
 
     fun toAstcQuality(): PvrConverter.AstcQuality = when (this) {
         ASTC_4x4 -> PvrConverter.AstcQuality.ASTC_4x4
@@ -79,7 +81,7 @@ fun PbrEditorScreen(
 
     // ===== 源数据（编辑期只保留降采样预览，导出时重新解码全分辨率）=====
     var previewSrc by remember { mutableStateOf<Bitmap?>(null) }
-    var infoText by remember { mutableStateOf("解码中...") }
+    var infoText by remember { mutableStateOf(L.s(R.string.x_decoding)) }
     var error by remember { mutableStateOf<String?>(null) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
 
@@ -108,7 +110,7 @@ fun PbrEditorScreen(
         withContext(Dispatchers.IO) {
             try {
                 val raw = context.contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
-                    ?: throw IllegalStateException("无法读取文件")
+                    ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                 val data = if (DvplCodec.isDvplFile(raw))
                     try { DvplCodec.decode(raw) } catch (e: Exception) { raw }
                 else raw
@@ -121,7 +123,7 @@ fun PbrEditorScreen(
                 } else if (data.size >= 8 && data[0] == 0x89.toByte() && data[1] == 0x50.toByte()) {
                     bmp = BitmapFactory.decodeByteArray(data, 0, data.size)
                 }
-                if (bmp == null) throw IllegalArgumentException("无法解码（支持 PVR/DDS/PNG）")
+                if (bmp == null) throw IllegalArgumentException(L.s(R.string.e_pbr_formats))
                 // 降采样预览（≤1024）
                 val maxSide = 1024
                 val scale = minOf(1f, maxSide.toFloat() / maxOf(bmp.width, bmp.height))
@@ -130,10 +132,10 @@ fun PbrEditorScreen(
                 val scaled = if (scale < 1f) Bitmap.createScaledBitmap(bmp, pw, ph, true) else bmp
                 previewSrc = scaled
                 infoText = fileName + "  " + bmp.width + "x" + bmp.height +
-                    (if (scale < 1f) "（预览已缩放，导出为原始分辨率）" else "")
+                    (if (scale < 1f) L.s(R.string.x_preview_scaled) else "")
                 if (bmp !== scaled) bmp.recycle()
             } catch (e: Exception) {
-                error = e.message ?: "解码失败"
+                error = e.message ?: L.s(R.string.x_decode_fail)
             }
         }
     }
@@ -166,13 +168,13 @@ fun PbrEditorScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("PBR 贴图编辑", style = MaterialTheme.typography.titleMedium) },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") } },
+                title = { Text(L.s(R.string.l_pbr_title), style = MaterialTheme.typography.titleMedium) },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, L.s(R.string.b_back)) } },
                 actions = {
                     TextButton(
                         onClick = { showExportDialog = true },
                         enabled = previewSrc != null && !isExporting
-                    ) { Text(if (isExporting) "导出中..." else "导出") }
+                    ) { Text(if (isExporting) L.s(R.string.x_exporting) else L.s(R.string.b_export)) }
                 }
             )
         }
@@ -187,7 +189,7 @@ fun PbrEditorScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             if (error != null) {
-                Text("出错：" + (error ?: ""), color = MaterialTheme.colorScheme.error)
+                Text(L.s(R.string.x_error_prefix) + (error ?: ""), color = MaterialTheme.colorScheme.error)
             } else if (previewSrc == null) {
                 Text(infoText)
             } else {
@@ -197,7 +199,7 @@ fun PbrEditorScreen(
             shown?.let {
                 Image(
                     bitmap = it.asImageBitmap(),
-                    contentDescription = "预览",
+                    contentDescription = L.s(R.string.b_preview),
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 360.dp),
@@ -206,19 +208,19 @@ fun PbrEditorScreen(
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = showOriginal, onCheckedChange = { showOriginal = it })
-                Text("查看原图")
+                Text(L.s(R.string.b_view_orig))
             }
 
             Divider()
 
-            Text("编辑操作", style = MaterialTheme.typography.titleSmall)
+            Text(L.s(R.string.l_edit_ops), style = MaterialTheme.typography.titleSmall)
             PbrOp.values().forEach { o ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     RadioButton(selected = op == o, onClick = { op = o })
-                    Text(o.label, modifier = Modifier.padding(start = 8.dp))
+                    Text(L.s(o.labelRes), modifier = Modifier.padding(start = 8.dp))
                 }
             }
 
@@ -226,63 +228,63 @@ fun PbrEditorScreen(
 
             when (op) {
                 PbrOp.COLOR -> {
-                    Text("色相偏移：" + hue + "°")
+                    Text(L.s(R.string.l_hue) + hue + "°")
                     Slider(value = hue.toFloat(), onValueChange = { hue = it.toInt() }, valueRange = -180f..180f)
-                    Text("饱和度：" + sat + "%")
+                    Text(L.s(R.string.l_saturation) + sat + "%")
                     Slider(value = sat.toFloat(), onValueChange = { sat = it.toInt() }, valueRange = 0f..200f)
-                    Text("明度：" + bright)
+                    Text(L.s(R.string.l_brightness) + bright)
                     Slider(value = bright.toFloat(), onValueChange = { bright = it.toInt() }, valueRange = -100f..100f)
                 }
                 PbrOp.GLOSS -> {
-                    Text("光泽度：" + gloss + "（正=更亮更光滑）")
+                    Text(L.s(R.string.l_gloss) + gloss + L.s(R.string.x_gloss_hint))
                     Slider(value = gloss.toFloat(), onValueChange = { gloss = it.toInt() }, valueRange = -100f..100f)
-                    Text("金属感：" + metal)
+                    Text(L.s(R.string.l_metal) + metal)
                     Slider(value = metal.toFloat(), onValueChange = { metal = it.toInt() }, valueRange = -100f..100f)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("原厂" to (0 to 0), "哑光" to (-40 to 0), "亮漆" to (70 to 0), "镀铬" to (100 to 100)).forEach { (name, params) ->
+                        listOf(L.s(R.string.gloss_stock) to (0 to 0), L.s(R.string.gloss_matte) to (-40 to 0), L.s(R.string.gloss_gloss) to (70 to 0), L.s(R.string.gloss_chrome) to (100 to 100)).forEach { (name, params) ->
                             OutlinedButton(onClick = { gloss = params.first; metal = params.second }) { Text(name) }
                         }
                     }
                     Text(
-                        "RM 布局：RGB=粗糙度、A=金属度。",
+                        L.s(R.string.t_rm_layout),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 PbrOp.NORMAL -> {
-                    Text("强度：" + strength + "%")
+                    Text(L.s(R.string.l_strength) + strength + "%")
                     Slider(value = strength.toFloat(), onValueChange = { strength = it.toInt() }, valueRange = 10f..200f)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = invertBump, onCheckedChange = { invertBump = it })
-                        Text("反转凹凸")
+                        Text(L.s(R.string.l_invert_bump))
                     }
                     Text(
-                        "从颜色图亮度生成法线（Sobel）。暂时仅支持PC端法线贴图",
+                        L.s(R.string.t_normal_gen),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 PbrOp.CHANNEL -> {
-                    Text("交换通道", style = MaterialTheme.typography.titleSmall)
+                    Text(L.s(R.string.l_swap_channels), style = MaterialTheme.typography.titleSmall)
                     val swaps = listOf("RG", "RB", "GB", "RA", "GA", "BA")
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                        FilterChip(selected = swapPair.isEmpty(), onClick = { swapPair = "" }, label = { Text("不交换") })
+                        FilterChip(selected = swapPair.isEmpty(), onClick = { swapPair = "" }, label = { Text(L.s(R.string.ch_none)) })
                         swaps.forEach { s ->
                             FilterChip(selected = swapPair == s, onClick = { swapPair = s }, label = { Text(s) })
                         }
                     }
-                    Text("反转通道", style = MaterialTheme.typography.titleSmall)
+                    Text(L.s(R.string.l_invert_channels), style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        FilterChip(selected = invertR, onClick = { invertR = !invertR }, label = { Text("反R") })
-                        FilterChip(selected = invertG, onClick = { invertG = !invertG }, label = { Text("反G") })
-                        FilterChip(selected = invertB, onClick = { invertB = !invertB }, label = { Text("反B") })
-                        FilterChip(selected = invertA, onClick = { invertA = !invertA }, label = { Text("反A") })
+                        FilterChip(selected = invertR, onClick = { invertR = !invertR }, label = { Text(L.s(R.string.ch_inv_r)) })
+                        FilterChip(selected = invertG, onClick = { invertG = !invertG }, label = { Text(L.s(R.string.ch_inv_g)) })
+                        FilterChip(selected = invertB, onClick = { invertB = !invertB }, label = { Text(L.s(R.string.ch_inv_b)) })
+                        FilterChip(selected = invertA, onClick = { invertA = !invertA }, label = { Text(L.s(R.string.ch_inv_a)) })
                     }
-                    Text("提取通道为灰度", style = MaterialTheme.typography.titleSmall)
+                    Text(L.s(R.string.l_extract_gray), style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        FilterChip(selected = extractCh.isEmpty(), onClick = { extractCh = "" }, label = { Text("不提取") })
+                        FilterChip(selected = extractCh.isEmpty(), onClick = { extractCh = "" }, label = { Text(L.s(R.string.ch_no_extract)) })
                         listOf("R", "G", "B", "A").forEach { c ->
-                            FilterChip(selected = extractCh == c, onClick = { extractCh = c }, label = { Text("取" + c) })
+                            FilterChip(selected = extractCh == c, onClick = { extractCh = c }, label = { Text(L.s(R.string.ch_pick) + c) })
                         }
                     }
                 }
@@ -301,25 +303,25 @@ fun PbrEditorScreen(
         var linear by remember(op) { mutableStateOf(op != PbrOp.COLOR) }
         AlertDialog(
             onDismissRequest = { if (!isExporting) showExportDialog = false },
-            title = { Text("导出") },
+            title = { Text(L.s(R.string.b_export)) },
             text = {
                 Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                    Text("输出格式", style = MaterialTheme.typography.titleSmall)
+                    Text(L.s(R.string.l_out_format), style = MaterialTheme.typography.titleSmall)
                     PbrExportFormat.values().forEach { f ->
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             RadioButton(selected = fmt == f, onClick = { fmt = f })
-                            Text(f.label, modifier = Modifier.padding(start = 8.dp))
+                            Text(L.s(f.labelRes), modifier = Modifier.padding(start = 8.dp))
                         }
                     }
                     Divider(modifier = Modifier.padding(vertical = 8.dp))
-                    Text("色彩空间", style = MaterialTheme.typography.titleSmall)
+                    Text(L.s(R.string.l_colorspace), style = MaterialTheme.typography.titleSmall)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = !linear, onClick = { linear = false })
-                        Text("颜色贴图（sRGB）", modifier = Modifier.padding(start = 8.dp))
+                        Text(L.s(R.string.l_cs_albedo), modifier = Modifier.padding(start = 8.dp))
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(selected = linear, onClick = { linear = true })
-                        Text("数据贴图（线性）", modifier = Modifier.padding(start = 8.dp))
+                        Text(L.s(R.string.l_cs_data), modifier = Modifier.padding(start = 8.dp))
                     }
                 }
             },
@@ -341,19 +343,19 @@ fun PbrEditorScreen(
                                         },
                                         if (extractCh.isNotEmpty()) extractCh[0] else null)
                                 } catch (e: Exception) {
-                                    "导出失败：" + (e.message ?: "未知错误")
+                                    L.s(R.string.x_export_fail_prefix) + (e.message ?: L.s(R.string.x_unknown_error))
                                 } finally {
                                     isExporting = false
                                 }
                             }
-                            exportMessage = if (msg.startsWith("导出失败")) msg else "已导出：" + msg
+                            exportMessage = if (msg.startsWith(L.s(R.string.x_export_fail))) msg else L.s(R.string.x_exported_prefix) + msg
                         }
                     },
                     enabled = !isExporting
-                ) { Text("确认导出") }
+                ) { Text(L.s(R.string.b_confirm_export)) }
             },
             dismissButton = {
-                TextButton(onClick = { showExportDialog = false }) { Text("取消") }
+                TextButton(onClick = { showExportDialog = false }) { Text(L.s(R.string.b_cancel)) }
             }
         )
     }
@@ -370,7 +372,7 @@ private fun exportFullRes(
     swap: Pair<Char, Char>?, invertSet: Set<Char>, extract: Char?
 ): String {
     val raw = context.contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
-        ?: throw IllegalStateException("无法读取文件")
+        ?: throw IllegalStateException(L.s(R.string.e_cant_read))
     val data = if (DvplCodec.isDvplFile(raw))
         try { DvplCodec.decode(raw) } catch (e: Exception) { raw }
     else raw
@@ -380,7 +382,7 @@ private fun exportFullRes(
     else if (DdsConverter.isDdsFile(data)) bmp = DdsConverter.decodeToBitmap(data)?.first
     else if (data.size >= 8 && data[0] == 0x89.toByte() && data[1] == 0x50.toByte())
         bmp = BitmapFactory.decodeByteArray(data, 0, data.size)
-    if (bmp == null) throw IllegalArgumentException("重新解码失败")
+    if (bmp == null) throw IllegalArgumentException(L.s(R.string.e_redecode))
 
     try {
         val w = bmp.width; val h = bmp.height

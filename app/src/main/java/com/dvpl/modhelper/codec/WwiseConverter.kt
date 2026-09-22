@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.codec
 
 import org.json.JSONObject
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 
 /**
  * Wwise PCK/BNK 解包与打包（纯字节级，无音频编解码）
@@ -29,7 +31,7 @@ object WwiseConverter {
         /** 提取到 wem 字节 */
         fun extractFrom(bank: ByteArray, dataStart: Int): ByteArray {
             require(offset >= 0 && size >= 0 && offset + size <= bank.size) {
-                "wem $id 越界（off=$offset size=$size）"
+                L.s(R.string.tpl_wem_oob, id, offset, size)
             }
             return bank.copyOfRange(offset, offset + size)
         }
@@ -140,7 +142,7 @@ object WwiseConverter {
      * 文件取自同一个新 wem 的头部，引擎拼接后即为完整新音频。
      */
     fun repack(bank: Bank, replacements: Map<Long, ByteArray>): RepackResult {
-        if (bank.entries.isEmpty()) throw IllegalStateException("该 bank 不含媒体数据，无法重打包")
+        if (bank.entries.isEmpty()) throw IllegalStateException(L.s(R.string.e_bank_no_media))
         // 先统一取媒体字节（小库直接持有；大库逐条从 original 拷贝）
         val media = ArrayList<ByteArray>(bank.entries.size)
         var truncated = 0
@@ -464,11 +466,11 @@ object WwiseConverter {
             }
             pos += 8 + sz
         }
-        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
-        if (channels < 1) throw IllegalArgumentException("PtADPCM 声道数异常（$channels）")
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException(L.s(R.string.e_wem_no_data))
+        if (channels < 1) throw IllegalArgumentException(L.s(R.string.tpl_pt_channels, channels))
         // frameSize：每个声道每帧占用的字节数
         val frameSize = blockAlign / channels
-        if (frameSize < 6) throw IllegalArgumentException("PtADPCM 帧大小异常（blockAlign=$blockAlign channels=$channels）")
+        if (frameSize < 6) throw IllegalArgumentException(L.s(R.string.tpl_pt_blockalign, blockAlign, channels))
         val samplesPerFrame = 2 + (frameSize - 5) * 2
         // 总帧组数（每"组"包含 channels 个帧，对应同一时间段的所有声道）
         val frameGroups = dataSize / blockAlign
@@ -598,9 +600,9 @@ object WwiseConverter {
             }
             pos += 8 + sz
         }
-        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
-        if (channels < 1 || channels > 8) throw IllegalArgumentException("IMA ADPCM 声道数异常（$channels）")
-        if (blockAlign < channels * 4 + 2) throw IllegalArgumentException("IMA ADPCM blockAlign 异常（$blockAlign）")
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException(L.s(R.string.e_wem_no_data))
+        if (channels < 1 || channels > 8) throw IllegalArgumentException(L.s(R.string.tpl_ima_channels, channels))
+        if (blockAlign < channels * 4 + 2) throw IllegalArgumentException(L.s(R.string.tpl_ima_blockalign, blockAlign))
 
         val frameSize   = blockAlign                           // 每帧总字节
         val chFrameSize = blockAlign / channels                // 每声道每帧字节
@@ -734,8 +736,8 @@ object WwiseConverter {
             }
             pos += 8 + sz
         }
-        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException("wem 缺少 data 块")
-        if (channels < 1 || channels > 8) throw IllegalArgumentException("Opus 声道数异常（$channels）")
+        if (dataOff < 0 || dataSize <= 0) throw IllegalArgumentException(L.s(R.string.e_wem_no_data))
+        if (channels < 1 || channels > 8) throw IllegalArgumentException(L.s(R.string.tpl_opus_channels, channels))
 
         // 2. 收集 Opus packets（每帧前缀 u16 长度）
         val packets = ArrayList<ByteArray>()
@@ -748,7 +750,7 @@ object WwiseConverter {
             packets.add(wem.copyOfRange(p, p + pktLen))
             p += pktLen
         }
-        if (packets.isEmpty()) throw IllegalArgumentException("Opus wem 无有效帧")
+        if (packets.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_opus_no_frames))
 
         // 3. 构造 OpusHead（19 字节）供 MediaCodec CSD
         val opusHead = ByteArray(19)
@@ -828,7 +830,7 @@ object WwiseConverter {
         }
 
         val pcm = pcmOut.toByteArray()
-        if (pcm.isEmpty()) throw IllegalStateException("Opus 解码输出为空")
+        if (pcm.isEmpty()) throw IllegalStateException(L.s(R.string.e_opus_empty))
 
         val wav = ByteArray(44 + pcm.size)
         "RIFF".toByteArray(Charsets.US_ASCII).copyInto(wav, 0)
@@ -980,61 +982,129 @@ object WwiseConverter {
         return out
     }
 
-    // ---------- OGG → WEM 编码（fmt 0x28 + vorb 0x2A + 2 字节头包格式） ----------
+    // ---------- OGG → WEM 编码（fmt 0x42 + 外部码书 ID，Wwise 2019 格式） ----------
 
     /**
-     * 把标准 Vorbis OGG 编码为游戏可用 wem（Wwise Vorbis，内联完整码书）。
-     *
-     * 格式参照 ww2ogg 0.24 的 wwriff.cpp 逆向规格，已在 PC 上对 8 个样本
-     * （mono/stereo × q3/q5/q8 + 5 个真实游戏音源往返）做到 PCM 逐字节一致：
-     *  - fmt 0x28：codec 0xFFFF，ext 0x16，subtype 1ch=4/2ch=3/4ch=0x33，
-     *    KSDATAFORMAT_SUBTYPE_Vorbis GUID
-     *  - vorb 0x2A：totalSamples@0、mod_signal=0x4A@4、setupOffset=0@0x10、
-     *    firstAudioOffset@0x14、uid=0@0x24、bs0@0x28、bs1@0x29
-     *  - data：[u16 size][packet]×，setup 包在前（内联完整码书，无 "\x05vorbis"
-     *    前缀、无 22 位 time-domain 占位），音频包字节直拷（无 granule）
-     *
-     * 限制：包 ≥ 0x8000 字节拒绝（Wwise 2 字节头格式上限）；码书查找表类型
-     * 2/3 拒绝（ww2ogg 不支持）；仅 1/2/4 声道；不支持链式 Ogg。
+     * packed_codebooks_aoTuV_603.bin 解析缓存。
+     * 格式：前 N 个码书 blob（stripped，无 BCV 前缀），末尾 offset table（4字节×(N+1)）。
+     * 调用 loadPackedCodebooks() 初始化后，cbIdByBytes 可用于 10-bit ID 查找。
      */
-    fun oggToWem(ogg: ByteArray): ByteArray {
+    private var pcbBytes: ByteArray? = null
+    private var cbCount: Int = 0
+    // key = ByteArray内容包装（避免引用比较），value = codebook ID (0-based)
+    private var cbIdByBytes: HashMap<String, Int>? = null
+
+    /**
+     * 加载外部码书库（首次调用解析，后续复用同一字节数组则跳过）。
+     * pcb 为 packed_codebooks_aoTuV_603.bin 的完整字节。
+     */
+    fun loadPackedCodebooks(pcb: ByteArray) {
+        if (pcb === pcbBytes) return          // 同一实例无需重复解析
+        pcbBytes = pcb
+        cbIdByBytes = null
+
+        // offset table 在文件末尾；每条 u32 LE，共 count+1 个偏移
+        // 规则：tableAt = file.size - 4*(count+1)；count 从条目 [count] 偏移推算
+        // 实际文件：size=74387，tableAt=71991，count=598（599 个 u32，对应 598 条码书）
+        val fileSize = pcb.size
+        // 找 tableAt：从末尾往前找第一个合理的 u32 序列
+        // 已知：tableAt = fileSize - 4*(N+1)，且 pcb[tableAt..tableAt+4N]
+        // 用二分：先读末 4 字节 = 最后一个 offset table 项 = fileSize（总大小？）
+        // 实际验证：table[598]=71991（blob 区大小），table[0]=0
+        // 所以最后 4 字节 = offset[count] = blob 区总大小 = tableAt
+        val blobSize = readU32(pcb, fileSize - 4)  // 应等于 tableAt
+        if (blobSize <= 0 || blobSize >= fileSize) throw IllegalArgumentException(L.s(R.string.e_pcb_format))
+        val tableAt = blobSize
+        val tableBytes = fileSize - tableAt
+        if (tableBytes % 4 != 0) throw IllegalArgumentException(L.s(R.string.e_pcb_align))
+        val n = tableBytes / 4 - 1  // 条目数
+        cbCount = n
+
+        val map = HashMap<String, Int>(n * 2)
+        for (i in 0 until n) {
+            val start = readU32(pcb, tableAt + i * 4)
+            val end = readU32(pcb, tableAt + (i + 1) * 4)
+            if (start < 0 || end < start || end > blobSize)
+                throw IllegalArgumentException(L.s(R.string.tpl_pcb_oob, i))
+            // key：hex string of the blob bytes（避免 ByteArray equals 问题）
+            val key = pcbBlobKey(pcb, start, end - start)
+            map[key] = i
+        }
+        cbIdByBytes = map
+    }
+
+    /** 把 packed_codebooks blob 字节转为可作 map key 的字符串 */
+    private fun pcbBlobKey(data: ByteArray, start: Int, len: Int): String {
+        // 用 ISO-8859-1 1:1 映射，无编码损失
+        return String(data, start, len, Charsets.ISO_8859_1)
+    }
+
+    /**
+     * 把标准 Vorbis OGG 编码为游戏可用 wem（Wwise 2019，fmt 0x42，外部码书 ID）。
+     *
+     * 格式对应 Wwise 2019 新格式（vgmstream "new format"）：
+     *  - RIFF/WAVE，仅 fmt（0x42字节）+ data 两个 chunk，无 vorb 块
+     *  - fmt[0x18..0x27]：Wwise private "GUID"区 = totalSamples(4)+loopStart(4)+
+     *    loopEnd(4)+loopBeginExtra(2)+loopEndExtra(2)
+     *  - fmt[0x28..]：seekTableSize=0、audioOffset、maxPacketSize、bs0/bs1 等
+     *  - data：[u16 size][packet]×，setup 在前（8-bit count_minus1 + N×10-bit 外部码书 ID +
+     *    剥离 type 字段后的 floors/residues/mappings/modes），音频包为 mod_packets 变换格式
+     *
+     * 须先调用 loadPackedCodebooks()；OGG 须由 aoTuV b6.03 编码（WwiseNative.pcmToOgg）
+     * 以确保码书与 aoTuV 603 库匹配。fmt[0x1C]=0xDD 表示 mod_packets。
+     */
+    fun oggToWem(ogg: ByteArray, packedCodebooks: ByteArray): ByteArray {
+        loadPackedCodebooks(packedCodebooks)
+        val map = cbIdByBytes
+            ?: throw IllegalStateException(L.s(R.string.e_pcb_init))
+
         val parsed = parseOggPages(ogg)
         val packets = parsed.packets
-        if (packets.size < 4) throw IllegalArgumentException("OGG 数据包过少（" + packets.size + "）")
+        if (packets.size < 4) throw IllegalArgumentException(L.s(R.string.x_ogg_few_prefix) + packets.size + "）")
         val idP = packets[0]
         val commentP = packets[1]
         val setupP = packets[2]
         if (idP.size < 30 || idP[0] != 1.toByte() || String(idP, 1, 6, Charsets.US_ASCII) != "vorbis")
-            throw IllegalArgumentException("不是 Vorbis 音频（ID 头缺失或损坏）")
+            throw IllegalArgumentException(L.s(R.string.e_not_vorbis))
         if (commentP.isEmpty() || commentP[0] != 3.toByte())
-            throw IllegalArgumentException("注释头缺失（异常 OGG）")
+            throw IllegalArgumentException(L.s(R.string.e_no_comment))
         if (setupP.isEmpty() || setupP[0] != 5.toByte())
-            throw IllegalArgumentException("设置头缺失（异常 OGG）")
+            throw IllegalArgumentException(L.s(R.string.e_no_setup))
 
         val channels = idP[11].toInt() and 0xFF
         val sampleRate = readU32(idP, 12)
         val bitrateNominal = readU32(idP, 20)
-        // Vorbis ID 头按 LSB-first 位序打包：低 nibble = blocksize_0（小窗），高 nibble = blocksize_1
+        // Vorbis ID 头 LSB-first：低 nibble = bs0，高 nibble = bs1
         val bs0 = idP[28].toInt() and 0x0F
         val bs1 = (idP[28].toInt() shr 4) and 0x0F
         val totalSamples = parsed.pages.last().granule
-        if (totalSamples <= 0) throw IllegalArgumentException("无法确定总采样数（末页 granule=0，异常 OGG）")
-        if (sampleRate <= 0) throw IllegalArgumentException("采样率异常（" + sampleRate + "）")
+        if (totalSamples <= 0) throw IllegalArgumentException(L.s(R.string.e_no_granule))
+        if (sampleRate <= 0) throw IllegalArgumentException(L.s(R.string.x_rate_prefix) + sampleRate + "）")
 
-        val subtype = when (channels) {
-            1 -> 4
-            2 -> 3
-            4 -> 0x33
-            else -> throw IllegalArgumentException("不支持的声道数 " + channels + "（仅支持 1/2/4 声道）")
+        // Wwise 2019 channelMask 编码（低字节 = 声道数，高字节 = 布局类型）
+        val channelMask = when (channels) {
+            1 -> 0x00004101
+            2 -> 0x00003102
+            4 -> 0x00003F04  // 4ch：待验证，暂用合理推测值
+            else -> throw IllegalArgumentException(L.s(R.string.x_ch_prefix) + channels + L.s(R.string.x_ch_suffix))
         }
 
-        val setupWem = transformSetupPacket(setupP)
-        val audio = packets.subList(3, packets.size)
+        // setup 包：转换为外部码书 ID 格式（同时取回 mode 表供音频包变换）
+        val setupT = transformSetupPacketExternal(setupP, map, channels)
+        val setupWem = setupT.bytes
+        // 音频包：mod_packets 位变换（剥 type/window 位）
+        val audio = packets.subList(3, packets.size).map {
+            transformAudioPacketMod(it, setupT.modeBits, setupT.blockFlags)
+        }
         for (p in listOf(setupWem) + audio) {
             if (p.size >= 0x8000)
-                throw IllegalArgumentException("音频包过大（" + p.size + "B ≥ 32KB 上限）：请用较低质量重新编码 OGG")
+                throw IllegalArgumentException(L.s(R.string.x_pkt_prefix) + p.size + L.s(R.string.x_pkt_suffix))
         }
 
+        // 扫描最大音频包大小
+        val maxPktSize = audio.maxOfOrNull { it.size } ?: 0
+
+        // data 区：setup + audio，每包 [u16 LE size][payload]
         val data = ByteArray(2 * (1 + audio.size) + setupWem.size + audio.sumOf { it.size })
         var dp = 0
         for (p in listOf(setupWem) + audio) {
@@ -1044,96 +1114,93 @@ object WwiseConverter {
             dp += p.size
         }
 
-        // fmt 块（0x28）
-        val fmt = ByteArray(0x28)
-        fmt.writeU16(0xFFFF, 0)
-        fmt.writeU16(channels, 2)
-        fmt.writeU32(sampleRate, 4)
+        val audioOffset = 2 + setupWem.size  // audio 包在 data 中的起始偏移
+
+        // avgBytesPerSec
         val avgBps = if (bitrateNominal > 0) (bitrateNominal + 7) / 8
         else ((data.size.toLong() * sampleRate + totalSamples - 1) / totalSamples).toInt()
-        fmt.writeU32(avgBps, 8)
-        fmt.writeU16(0, 10)
-        fmt.writeU16(0, 12)
-        fmt.writeU16(0x16, 0x10)
-        fmt.writeU16(0, 0x12)
-        fmt.writeU32(subtype, 0x14)
-        // KSDATAFORMAT_SUBTYPE_Vorbis：01-00-00-00-00-00-10-00-80-00-00-AA-00-38-9B-71
-        val guid = byteArrayOf(1, 0, 0, 0, 0, 0, 0x10, 0, 0x80.toByte(), 0, 0, 0xAA.toByte(), 0, 0x38, 0x9B.toByte(), 0x71)
-        guid.copyInto(fmt, 0x18)
 
-        // vorb 块（0x2A）
-        val vorb = ByteArray(0x2A)
-        vorb.writeU32(totalSamples.toInt(), 0x00)
-        vorb.writeU32(0x4A, 0x04)              // mod_signal：标准包格式
-        vorb.writeU32(0, 0x08)
-        vorb.writeU32(0, 0x0C)
-        vorb.writeU32(0, 0x10)                 // setupOffset：完整 setup 内联在 data 里
-        vorb.writeU32(2 + setupWem.size, 0x14) // firstAudioOffset（相对 data）
-        vorb.writeU32(0, 0x18)
-        vorb.writeU32(0, 0x1C)
-        vorb.writeU32(0, 0x20)
-        vorb.writeU32(0, 0x24)                 // uid
-        vorb[0x28] = bs0.toByte()
-        vorb[0x29] = bs1.toByte()
+        // fmt 块（0x42 = 66 字节）
+        val fmt = ByteArray(0x42)
+        fmt.writeU16(0xFFFF, 0x00)                          // codec
+        fmt.writeU16(channels, 0x02)
+        fmt.writeU32(sampleRate, 0x04)
+        fmt.writeU32(avgBps, 0x08)
+        fmt.writeU16(0, 0x0C)                               // blockAlign
+        fmt.writeU16(0, 0x0E)                               // bitsPerSample
+        fmt.writeU16(0x0030, 0x10)                          // cbSize = 48
+        fmt.writeU16(0, 0x12)                               // validBits
+        fmt.writeU32(channelMask, 0x14)
+        // fmt[0x18..0x27] = Wwise "GUID" 区（16 字节 = loop/总采样信息）
+        fmt.writeU32(totalSamples.toInt(), 0x18)            // totalSamples
+        fmt.writeU32(0x000000DD, 0x1C)                      // mod signal：0xDD = mod_packets 格式
+        fmt.writeU32(data.size, 0x20)                       // loopEndPktOff = data 区大小
+        fmt.writeU16(0, 0x24)                               // loopBeginExtra
+        fmt.writeU16(0, 0x26)                               // loopEndExtra
+        // fmt[0x28..0x41] = Wwise Vorbis extra（26 字节）
+        fmt.writeU32(0, 0x28)                               // seekTableSize = 0
+        fmt.writeU32(audioOffset, 0x2C)                     // audioOffset（相对 data 起始）
+        fmt.writeU16(maxPktSize, 0x30)                      // maxPacketSize
+        fmt.writeU16(0, 0x32)                               // lastGranuleExtra
+        fmt.writeU32(0, 0x34)                               // decodeAllocSize（提示值，0 安全）
+        fmt.writeU32(0, 0x38)                               // decodeX64AllocSize
+        fmt.writeU32(0, 0x3C)                               // uid
+        fmt[0x40] = bs0.toByte()
+        fmt[0x41] = bs1.toByte()
 
-        val body = ByteArray(8 * 3 + fmt.size + vorb.size + data.size)
+        // 组装 RIFF：仅 fmt + data（无 vorb 块）
+        val bodySize = 8 + fmt.size + 8 + data.size
+        val out = ByteArray(12 + bodySize)
         var bp = 0
-        fun putChunk(id: String, payload: ByteArray) {
-            for (i in 0 until 4) body[bp + i] = id[i].code.toByte()
-            bp += 4
-            body.writeU32(payload.size, bp); bp += 4
-            payload.copyInto(body, bp); bp += payload.size
-        }
-        putChunk("fmt ", fmt)
-        putChunk("vorb", vorb)
-        putChunk("data", data)
+        fun putFourCC(s: String) { for (i in 0 until 4) out[bp + i] = s[i].code.toByte(); bp += 4 }
+        fun putU32(v: Int) { out.writeU32(v, bp); bp += 4 }
+        fun putBytes(b: ByteArray) { b.copyInto(out, bp); bp += b.size }
 
-        val out = ByteArray(12 + body.size)
-        "RIFF".toByteArray(Charsets.US_ASCII).copyInto(out, 0)
-        out.writeU32(4 + body.size, 4)
-        "WAVE".toByteArray(Charsets.US_ASCII).copyInto(out, 8)
-        body.copyInto(out, 12)
+        putFourCC("RIFF"); putU32(4 + bodySize)
+        putFourCC("WAVE")
+        putFourCC("fmt "); putU32(fmt.size); putBytes(fmt)
+        putFourCC("data"); putU32(data.size); putBytes(data)
+
         return out
     }
 
     /**
-     * 生成的 wem 结构自检：走一遍 chunk 表与 data 包链，确认
-     * setup 包以码书同步开头、包头逐个衔接且恰好覆盖到 data 末尾。
+     * 生成的 wem 结构自检（fmt 0x42 外部码书格式）：
+     * 验证 chunk 表、data 包链、setup 包 count 字段合理性。
      * 返回 null = 通过；否则返回中文错误说明。
      */
     fun validateWemStructure(wem: ByteArray): String? {
         if (wem.size < 12 || String(wem, 0, 4, Charsets.US_ASCII) != "RIFF" ||
-            String(wem, 8, 4, Charsets.US_ASCII) != "WAVE") return "RIFF 头损坏"
+            String(wem, 8, 4, Charsets.US_ASCII) != "WAVE") return L.s(R.string.e_riff)
         var pos = 12
         var dataStart = -1
         var dataSize = 0
         while (pos + 8 <= wem.size) {
             val id = String(wem, pos, 4, Charsets.US_ASCII)
             val sz = readU32(wem, pos + 4)
-            if (sz < 0 || pos + 8 + sz > wem.size) return "chunk 表越界（" + id + "）"
+            if (sz < 0 || pos + 8 + sz > wem.size) return L.s(R.string.x_chunk_prefix) + id + "）"
             if (id == "data") { dataStart = pos + 8; dataSize = sz }
             pos += 8 + sz
         }
-        if (pos != wem.size) return "chunk 表未覆盖整个文件"
-        if (dataStart < 0) return "缺少 data 块"
+        if (pos != wem.size) return L.s(R.string.e_chunk_cover)
+        if (dataStart < 0) return L.s(R.string.e_no_data_chunk)
         var p = dataStart
         val end = dataStart + dataSize
         var first = true
         while (p < end) {
-            if (p + 2 > end) return "包头截断（data 偏移 " + (p - dataStart) + "）"
+            if (p + 2 > end) return L.s(R.string.x_hdr_trunc) + (p - dataStart) + "）"
             val size = (wem[p].toInt() and 0xFF) or ((wem[p + 1].toInt() and 0xFF) shl 8)
-            if (size == 0) return "零长度包（data 偏移 " + (p - dataStart) + "）"
-            if (p + 2 + size > end) return "包越界（data 偏移 " + (p - dataStart) + "，声明 " + size + "）"
+            if (size == 0) return L.s(R.string.x_zero_pkt) + (p - dataStart) + "）"
+            if (p + 2 + size > end) return L.s(R.string.x_pkt_oob) + (p - dataStart) + L.s(R.string.x_declared) + size + "）"
             if (first) {
-                val bits = LogicBits(wem, p + 2, size)
-                val count = bits.read(0, 8) + 1
-                if (count < 1 || count > 200) return "码书数量异常（" + count + "）"
-                if (bits.read(8, 24) != 0x564342) return "码书同步标志损坏"
+                // 外部码书格式：第一字节 = count_minus1（0..255 均合法）
+                val count = (wem[p + 2].toInt() and 0xFF) + 1
+                if (count < 1 || count > 256) return L.s(R.string.x_setup_count) + count + "）"
                 first = false
             }
             p += 2 + size
         }
-        return if (p == end) null else "包链长度与 data 块不符"
+        return if (p == end) null else L.s(R.string.e_chain_mismatch)
     }
 
     // ---------- OGG 解析 ----------
@@ -1146,29 +1213,28 @@ object WwiseConverter {
         var pos = 0
         while (pos + 27 <= buf.size) {
             if (String(buf, pos, 4, Charsets.US_ASCII) != "OggS")
-                throw IllegalArgumentException("Ogg 页头损坏（偏移 " + pos + "）")
+                throw IllegalArgumentException(L.s(R.string.x_page_hdr) + pos + "）")
             val granule = readU64(buf, pos + 6)
             val serial = readU32(buf, pos + 14)
             val nsegs = buf[pos + 26].toInt() and 0xFF
-            if (pos + 27 + nsegs > buf.size) throw IllegalArgumentException("Ogg 段表被截断")
+            if (pos + 27 + nsegs > buf.size) throw IllegalArgumentException(L.s(R.string.e_seg_trunc))
             var payloadLen = 0
             for (i in 0 until nsegs) payloadLen += buf[pos + 27 + i].toInt() and 0xFF
             val payload = pos + 27 + nsegs
-            if (payload + payloadLen > buf.size) throw IllegalArgumentException("Ogg 页被截断")
+            if (payload + payloadLen > buf.size) throw IllegalArgumentException(L.s(R.string.e_page_trunc))
             pages.add(OggPage(granule, serial, buf.copyOfRange(pos + 27, pos + 27 + nsegs), payload, payloadLen))
             pos = payload + payloadLen
         }
-        if (pos != buf.size) throw IllegalArgumentException("文件末尾有多余数据（非完整 Ogg）")
-        if (pages.isEmpty()) throw IllegalArgumentException("空的 Ogg 文件")
+        if (pos != buf.size) throw IllegalArgumentException(L.s(R.string.e_trailing))
+        if (pages.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_empty_ogg))
         if (pages.map { it.serial }.distinct().size != 1)
-            throw IllegalArgumentException("包含多个逻辑比特流（不支持链式 Ogg）")
+            throw IllegalArgumentException(L.s(R.string.e_chained_ogg))
         val packets = ArrayList<ByteArray>()
         var cur = ByteArray(0)
         var building = false
         for (pg in pages) {
             var off = pg.payload
             for (lacingB in pg.segTable) {
-                // Byte 是有符号的：255 会变 -1，必须先转无符号
                 val lacing = lacingB.toInt() and 0xFF
                 if (!building) { cur = ByteArray(0); building = true }
                 cur += buf.copyOfRange(off, off + lacing)
@@ -1186,13 +1252,13 @@ object WwiseConverter {
         } catch (e: Exception) { -1L }
     }
 
-    // ---------- setup 包手术（标准 OGG → Wwise 内联完整码书） ----------
+    // ---------- setup 包手术（标准 OGG → Wwise 外部码书 ID 格式） ----------
 
     /** LSB-first 逻辑位流（Vorbis 规范位序），位偏移相对于 start */
     private class LogicBits(private val b: ByteArray, private val start: Int, val byteLen: Int) {
         val bitLen = byteLen * 8
         fun get(p: Int): Boolean {
-            if (p < 0 || p >= bitLen) throw IndexOutOfBoundsException("位偏移越界（" + p + "/" + bitLen + "）")
+            if (p < 0 || p >= bitLen) throw IndexOutOfBoundsException(L.s(R.string.x_bit_oob) + p + "/" + bitLen + "）")
             return (b[start + (p shr 3)].toInt() shr (p and 7)) and 1 == 1
         }
         fun read(base: Int, n: Int): Int {
@@ -1202,99 +1268,354 @@ object WwiseConverter {
         }
     }
 
+    /** LSB-first 位写入缓冲 */
+    private class BitWriter {
+        private val buf = ArrayList<Byte>(256)
+        private var cur = 0
+        private var bits = 0
+
+        fun write(value: Int, nBits: Int) {
+            var v = value
+            var n = nBits
+            while (n > 0) {
+                val space = 8 - bits
+                val take = minOf(n, space)
+                cur = cur or ((v and ((1 shl take) - 1)) shl bits)
+                bits += take
+                v = v ushr take
+                n -= take
+                if (bits == 8) { buf.add(cur.toByte()); cur = 0; bits = 0 }
+            }
+        }
+
+        val bitCount: Int get() = buf.size * 8 + bits
+
+        fun toByteArray(): ByteArray {
+            val out = ByteArray(buf.size + if (bits > 0) 1 else 0)
+            for (i in buf.indices) out[i] = buf[i]
+            if (bits > 0) out[buf.size] = cur.toByte()
+            return out
+        }
+    }
+
     private fun ilog(v: Int): Int {
-        var x = v
-        var r = 0
+        var x = v; var r = 0
         while (x != 0) { r++; x = x ushr 1 }
         return r
     }
 
-    /** codebook.h _book_maptype1_quantvals */
     private fun maptype1Quantvals(entries: Int, dims: Int): Int {
         val bits = ilog(entries)
         var vals = entries shr ((bits - 1) * (dims - 1) / dims)
         while (true) {
-            var acc = 1L
-            var acc1 = 1L
+            var acc = 1L; var acc1 = 1L
             for (i in 0 until dims) { acc *= vals.toLong(); acc1 *= (vals + 1).toLong() }
             if (acc <= entries && acc1 > entries) return vals
             if (acc > entries) vals-- else vals++
-            if (vals < 1) throw IllegalArgumentException("码书 quantvals 计算异常")
+            if (vals < 1) throw IllegalArgumentException(L.s(R.string.e_quantvals))
         }
     }
 
     /**
-     * 扫描标准 Vorbis setup 包里的码书段，返回码书段结束的位偏移
-     *（对应 ww2ogg codebook.cpp copy() 的解析路径，仅支持查找表类型 0/1）。
+     * 解析一个标准 OGG 码书（从 bits[p0] 开始，含 24-bit BCV 头），
+     * 同时转换为 Wwise packed_codebooks 的紧凑 blob 格式，返回 (新 bit 偏移, blob 键)。
+     *
+     * 紧凑格式（对照 ww2ogg codebook.cpp rebuild()，Wwise 官方打包器约定）：
+     *  dims(4), entries(14), ordered(1)；
+     *  ordered: init_len-1(5), 逐段 count(ilog(entries-cur))；
+     *  unordered: cll(3), sparse(1), 每条 [present(1) if sparse][len-1(cll)]；
+     *  lookup(1)，为 1 时 q_min(32) q_delta(32) value_bits-1(4) seq(1) + quantvals×value_bits 值。
+     *  cll = ilog(maxLen)（最大码字长度，经验证与全部 598 个库 blob 一致）。
+     *  blob 字节长度 = floor(总位数/8)+1（位对齐时尾部多一个零字节）。
      */
-    private fun scanCodebooks(bits: LogicBits, base: Int): Int {
-        var p = base
-        val count = bits.read(p, 8) + 1
-        p += 8
-        for (c in 0 until count) {
-            val id = bits.read(p, 24); p += 24
-            if (id != 0x564342)
-                throw IllegalArgumentException("码书同步标志损坏（第 " + c + " 个，读到 0x" + id.toString(16) + "）")
-            val dims = bits.read(p, 16); p += 16
-            val entries = bits.read(p, 24); p += 24
-            if (entries <= 0 || dims <= 0)
-                throw IllegalArgumentException("码书参数异常（第 " + c + " 个）")
-            val ordered = bits.get(p); p += 1
-            if (ordered) {
-                p += 5
-                var cur = 0
-                while (cur < entries) {
-                    val n = ilog(entries - cur)
-                    cur += bits.read(p, n); p += n
-                    if (cur > entries) throw IllegalArgumentException("有序码书长度表越界（第 " + c + " 个）")
-                }
-            } else {
-                val sparse = bits.get(p); p += 1
-                for (i in 0 until entries) {
-                    var present = true
-                    if (sparse) { present = bits.get(p); p += 1 }
-                    if (present) p += 5
+    private fun codebookToCompactKey(bits: LogicBits, p0: Int): Pair<Int, String> {
+        var p = p0
+        val sync = bits.read(p, 24); p += 24
+        if (sync != 0x564342)
+            throw IllegalArgumentException(L.s(R.string.x_bad_sync) + sync.toString(16) + "）")
+        val dims = bits.read(p, 16); p += 16
+        val entries = bits.read(p, 24); p += 24
+        if (entries <= 0 || dims <= 0) throw IllegalArgumentException(L.s(R.string.x_cb_params) + dims + " entries=" + entries + "）")
+        if (dims > 15 || entries > 16383)
+            throw IllegalArgumentException(L.s(R.string.x_cb_limit) + dims + " entries=" + entries + "）")
+        val w = BitWriter()
+        w.write(dims, 4)
+        w.write(entries, 14)
+        val ordered = bits.get(p); p += 1
+        w.write(if (ordered) 1 else 0, 1)
+        if (ordered) {
+            val init = bits.read(p, 5); p += 5
+            w.write(init, 5)
+            var cur = 0
+            while (cur < entries) {
+                val n = ilog(entries - cur)
+                val c = bits.read(p, n); p += n
+                w.write(c, n)
+                cur += c
+                if (cur > entries) throw IllegalArgumentException(L.s(R.string.e_ordered_oob))
+            }
+        } else {
+            val sparse = bits.get(p); p += 1
+            val lens = IntArray(entries)
+            var maxLen = 0
+            for (i in 0 until entries) {
+                var present = true
+                if (sparse) { present = bits.get(p); p += 1 }
+                if (present) {
+                    val l = bits.read(p, 5) + 1; p += 5
+                    lens[i] = l
+                    if (l > maxLen) maxLen = l
                 }
             }
-            val lookupType = bits.read(p, 4); p += 4
-            when (lookupType) {
-                0 -> {}
-                1 -> {
-                    p += 32 + 32
-                    val valueBits = bits.read(p, 4); p += 4
-                    p += 1
-                    p += maptype1Quantvals(entries, dims) * (valueBits + 1)
-                }
-                else -> throw IllegalArgumentException(
-                    "码书查找表类型 " + lookupType + " 不受支持：请用标准 libvorbis（ffmpeg 默认）重新编码 OGG")
+            val cll = maxOf(1, ilog(maxLen))
+            if (cll > 5) throw IllegalArgumentException(L.s(R.string.e_cll_range))
+            // 紧凑格式：cll(3) 在前，sparse(1) 在后（ww2ogg rebuild 的读取顺序）
+            w.write(cll, 3)
+            w.write(if (sparse) 1 else 0, 1)
+            for (i in 0 until entries) {
+                if (sparse) w.write(if (lens[i] > 0) 1 else 0, 1)
+                if (lens[i] > 0) w.write(lens[i] - 1, cll)
             }
         }
-        return p
+        val lookupType = bits.read(p, 4); p += 4
+        if (lookupType == 2) throw IllegalArgumentException(L.s(R.string.e_lookup2))
+        w.write(if (lookupType == 0) 0 else 1, 1)
+        if (lookupType == 1) {
+            val qMin = bits.read(p, 32); p += 32
+            val qDelta = bits.read(p, 32); p += 32
+            val valueBitsM1 = bits.read(p, 4); p += 4
+            val seq = bits.read(p, 1); p += 1
+            w.write(qMin, 32)
+            w.write(qDelta, 32)
+            w.write(valueBitsM1, 4)
+            w.write(seq, 1)
+            val qv = maptype1Quantvals(entries, dims)
+            for (i in 0 until qv) {
+                w.write(bits.read(p, valueBitsM1 + 1), valueBitsM1 + 1)
+                p += valueBitsM1 + 1
+            }
+        }
+        // blob 键：floor(nbits/8)+1 字节（尾部补零与库文件约定一致）
+        val bytes = w.toByteArray()
+        val blob = if (w.bitCount % 8 == 0) bytes + byteArrayOf(0) else bytes
+        return Pair(p, String(blob, Charsets.ISO_8859_1))
     }
 
-    /** setup 包手术：剥 7 字节 "\x05vorbis" 前缀、剥 22 位 time-domain 占位（应为 0），其余位原样保留 */
-    private fun transformSetupPacket(setup: ByteArray): ByteArray {
+    /** setup 变换结果：WEM setup 包 + 音频包变换所需的 mode 信息 */
+    private class SetupTransform(val bytes: ByteArray, val modeBits: Int, val blockFlags: BooleanArray)
+
+    /**
+     * setup 包转换：标准 OGG（libvorbis _vorbis_pack_books 语义）→ Wwise 外部码书 ID 格式。
+     *
+     * 码书 → 8-bit count_minus1 + N × 10-bit ID；随后按 Wwise 剥离规则重打包尾部
+     * （对照 ww2ogg wwriff.cpp 非 full_setup 分支）：
+     *  - 跳过 OGG 的 22-bit time-domain 占位（6+16 位 0）
+     *  - floor：不写 16-bit type（恒为 1）
+     *  - residue：type 只写 2 bit（OGG 为 16 bit）
+     *  - mapping：不写 16-bit type（恒为 0）；2-bit 保留字段照抄
+     *  - mode：不写 16-bit windowtype + 16-bit transformtype（恒为 0）
+     *  - 不写 OGG 末尾的 1-bit framing
+     */
+    private fun transformSetupPacketExternal(
+        setup: ByteArray,
+        idMap: HashMap<String, Int>,
+        channels: Int
+    ): SetupTransform {
         if (String(setup, 1, 6, Charsets.US_ASCII) != "vorbis")
-            throw IllegalArgumentException("设置头损坏")
+            throw IllegalArgumentException(L.s(R.string.e_bad_setup_hdr))
         val body = setup.copyOfRange(7, setup.size)
         val bits = LogicBits(body, 0, body.size)
-        val end = scanCodebooks(bits, 0)
-        if (end + 22 > bits.bitLen)
-            throw IllegalArgumentException("设置包在码书段后截断（异常 OGG）")
-        for (i in 0 until 22) {
-            if (bits.get(end + i))
-                throw IllegalArgumentException("time-domain 段非零（异常 OGG）")
+
+        var p = 0
+        val w = BitWriter()
+        val countMinus1 = bits.read(p, 8); p += 8
+        val count = countMinus1 + 1
+        w.write(countMinus1, 8)
+
+        for (c in 0 until count) {
+            val (newP, key) = codebookToCompactKey(bits, p)
+            val cbId = idMap[key]
+            if (cbId == null) {
+                val head = key.take(8).map { (it.code and 0xFF).toString(16).padStart(2, '0') }.joinToString("")
+                android.util.Log.e("AudioToWem", "codebook miss #" + c + " keyLen=" + key.length + "B head=" + head)
+                throw IllegalArgumentException(
+                    L.s(R.string.tpl_cb_miss_a, c) + key.length + L.s(R.string.x_cb_miss_b) + head + "）")
+            }
+            w.write(cbId, 10)
+            p = newP
         }
-        val rest = end + 22
-        val outBits = body.size * 8 - 22
-        val out = ByteArray((outBits + 7) / 8)
-        for (p in 0 until end) if (bits.get(p))
-            out[p shr 3] = (out[p shr 3].toInt() or (1 shl (p and 7))).toByte()
-        for (p in rest until bits.bitLen) {
-            val q = p - 22
-            if (bits.get(p)) out[q shr 3] = (out[q shr 3].toInt() or (1 shl (q and 7))).toByte()
+
+        // OGG time-domain 占位（6+16 位 0），WEM 不含，直接跳过
+        p += 22
+
+        // ---- floors（type 1）----
+        val floorCountM1 = bits.read(p, 6); p += 6
+        val floorCount = floorCountM1 + 1
+        w.write(floorCountM1, 6)
+        for (f in 0 until floorCount) {
+            val ftype = bits.read(p, 16); p += 16
+            if (ftype != 1) throw IllegalArgumentException(L.s(R.string.tpl_floor_type, ftype))
+            val partitions = bits.read(p, 5); p += 5
+            w.write(partitions, 5)
+            val partitionClass = IntArray(partitions)
+            var maxClass = 0
+            for (j in 0 until partitions) {
+                val pc = bits.read(p, 4); p += 4
+                partitionClass[j] = pc
+                if (pc > maxClass) maxClass = pc
+                w.write(pc, 4)
+            }
+            val classDims = IntArray(maxClass + 1)
+            for (j in 0..maxClass) {
+                val dimsM1 = bits.read(p, 3); p += 3
+                classDims[j] = dimsM1 + 1
+                w.write(dimsM1, 3)
+                val subclasses = bits.read(p, 2); p += 2
+                w.write(subclasses, 2)
+                if (subclasses != 0) {
+                    val masterbook = bits.read(p, 8); p += 8
+                    w.write(masterbook, 8)
+                }
+                for (k in 0 until (1 shl subclasses)) {
+                    val sb = bits.read(p, 8); p += 8
+                    w.write(sb, 8)
+                }
+            }
+            val multM1 = bits.read(p, 2); p += 2
+            w.write(multM1, 2)
+            val rangebits = bits.read(p, 4); p += 4
+            w.write(rangebits, 4)
+            for (j in 0 until partitions) {
+                val dims = classDims[partitionClass[j]]
+                for (k in 0 until dims) {
+                    w.write(bits.read(p, rangebits), rangebits)
+                    p += rangebits
+                }
+            }
         }
-        return out
+
+        // ---- residues ----
+        val resCountM1 = bits.read(p, 6); p += 6
+        val resCount = resCountM1 + 1
+        w.write(resCountM1, 6)
+        for (r in 0 until resCount) {
+            val rtype = bits.read(p, 16); p += 16
+            if (rtype > 2) throw IllegalArgumentException(L.s(R.string.tpl_residue_type, rtype))
+            w.write(rtype, 2)
+            val begin = bits.read(p, 24); p += 24
+            val end = bits.read(p, 24); p += 24
+            val sizeM1 = bits.read(p, 24); p += 24
+            val clsM1 = bits.read(p, 6); p += 6
+            val classbook = bits.read(p, 8); p += 8
+            w.write(begin, 24); w.write(end, 24); w.write(sizeM1, 24)
+            w.write(clsM1, 6); w.write(classbook, 8)
+            val classifications = clsM1 + 1
+            val cascade = IntArray(classifications)
+            for (j in 0 until classifications) {
+                val low = bits.read(p, 3); p += 3
+                w.write(low, 3)
+                val bitflag = bits.get(p); p += 1
+                w.write(if (bitflag) 1 else 0, 1)
+                var high = 0
+                if (bitflag) { high = bits.read(p, 5); p += 5; w.write(high, 5) }
+                cascade[j] = high * 8 + low
+            }
+            for (j in 0 until classifications) {
+                for (k in 0 until 8) {
+                    if (cascade[j] and (1 shl k) != 0) {
+                        val bk = bits.read(p, 8); p += 8
+                        w.write(bk, 8)
+                    }
+                }
+            }
+        }
+
+        // ---- mappings ----
+        val mapCountM1 = bits.read(p, 6); p += 6
+        val mapCount = mapCountM1 + 1
+        w.write(mapCountM1, 6)
+        val chBits = ilog(channels - 1)
+        for (m in 0 until mapCount) {
+            val mtype = bits.read(p, 16); p += 16
+            if (mtype != 0) throw IllegalArgumentException(L.s(R.string.tpl_mapping_type, mtype))
+            val submapsFlag = bits.get(p); p += 1
+            w.write(if (submapsFlag) 1 else 0, 1)
+            var submaps = 1
+            if (submapsFlag) {
+                val sm = bits.read(p, 4); p += 4
+                submaps = sm + 1
+                w.write(sm, 4)
+            }
+            val polar = bits.get(p); p += 1
+            w.write(if (polar) 1 else 0, 1)
+            if (polar) {
+                val stepsM1 = bits.read(p, 8); p += 8
+                w.write(stepsM1, 8)
+                val steps = stepsM1 + 1
+                for (j in 0 until steps) {
+                    val mag = bits.read(p, chBits); p += chBits
+                    val ang = bits.read(p, chBits); p += chBits
+                    w.write(mag, chBits); w.write(ang, chBits)
+                }
+            }
+            // 罕见的未被 Ak 移除的保留字段
+            val reserved = bits.read(p, 2); p += 2
+            if (reserved != 0) throw IllegalArgumentException(L.s(R.string.e_mapping_reserved))
+            w.write(reserved, 2)
+            if (submaps > 1) {
+                for (j in 0 until channels) {
+                    val mux = bits.read(p, 4); p += 4
+                    w.write(mux, 4)
+                }
+            }
+            for (j in 0 until submaps) {
+                val tc = bits.read(p, 8); p += 8
+                w.write(tc, 8)
+                val fn = bits.read(p, 8); p += 8
+                w.write(fn, 8)
+                val rn = bits.read(p, 8); p += 8
+                w.write(rn, 8)
+            }
+        }
+
+        // ---- modes ----
+        val modeCountM1 = bits.read(p, 6); p += 6
+        val modeCount = modeCountM1 + 1
+        w.write(modeCountM1, 6)
+        val blockFlags = BooleanArray(modeCount)
+        for (m in 0 until modeCount) {
+            val bf = bits.get(p); p += 1
+            blockFlags[m] = bf
+            w.write(if (bf) 1 else 0, 1)
+            // windowtype(16) + transformtype(16) 恒 0，OGG 有 WEM 无，跳过
+            p += 32
+            val mapping = bits.read(p, 8); p += 8
+            w.write(mapping, 8)
+        }
+        // OGG 尾部 1-bit framing：WEM 不含，跳过
+
+        return SetupTransform(w.toByteArray(), ilog(modeCount - 1), blockFlags)
+    }
+
+    /**
+     * mod_packets 音频包变换（OGG → Wwise）：
+     * 剥离 OGG 包头的 packet_type(1) + mode(mode_bits) 后重组为
+     * [mode(mode_bits)][OGG 位流自 (1|3)+mode_bits 起]，长窗再剥 prev/next window 各 1 bit。
+     * 对照 ww2ogg wwriff.cpp 1416-1502 的逆过程。
+     */
+    private fun transformAudioPacketMod(pkt: ByteArray, modeBits: Int, blockFlags: BooleanArray): ByteArray {
+        if (pkt.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_empty_audio_pkt))
+        val bits = LogicBits(pkt, 0, pkt.size)
+        if (bits.get(0)) throw IllegalArgumentException(L.s(R.string.e_pkt_type_bit))
+        val mode = bits.read(1, modeBits)
+        if (mode >= blockFlags.size) throw IllegalArgumentException(L.s(R.string.tpl_mode_oob, mode))
+        val w = BitWriter()
+        w.write(mode, modeBits)
+        val srcStart = if (blockFlags[mode]) 3 + modeBits else 1 + modeBits
+        for (i in srcStart until bits.bitLen) {
+            w.write(if (bits.get(i)) 1 else 0, 1)
+        }
+        return w.toByteArray()
     }
 
     // ---------- 工具 ----------

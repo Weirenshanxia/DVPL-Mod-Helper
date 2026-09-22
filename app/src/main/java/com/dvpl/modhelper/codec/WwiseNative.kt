@@ -44,6 +44,17 @@ object WwiseNative {
     }
 
     private external fun wwemToOgg(wemPath: String, oggPath: String, pcbPath: String): String?
+    private external fun wpcmToOgg(pcm: ByteArray, sampleRate: Int, channels: Int, quality: Float): ByteArray?
+
+    /**
+     * PCM（16-bit LE，interleaved）→ Ogg Vorbis 字节。
+     * quality: 0.0 ≈ ~80kbps, 0.3 ≈ ~112kbps stereo（推荐），1.0 最高质量。
+     * 失败返回 null。
+     */
+    fun pcmToOgg(pcm: ByteArray, sampleRate: Int, channels: Int, quality: Float = 0.3f): ByteArray? {
+        ensureLoaded()
+        return wpcmToOgg(pcm, sampleRate, channels, quality)
+    }
 
     /**
      * 一体化转换：wem 字节 → 修复过 granule 的 ogg 字节（自动处理临时文件与 revorb 等效修复）。

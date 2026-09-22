@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.codec
 
 import java.io.ByteArrayOutputStream
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.zip.CRC32
@@ -34,13 +36,13 @@ object DvplCodec {
      */
     fun decode(input: ByteArray): ByteArray {
         if (input.size < 20) {
-            throw IllegalArgumentException("文件太小，不是有效的 DVPL 文件")
+            throw IllegalArgumentException(L.s(R.string.e_dvpl_small))
         }
         
         // 检查魔数
         val magicStart = input.size - 4
         if (!input.sliceArray(magicStart until input.size).contentEquals(MAGIC_BYTES)) {
-            throw IllegalArgumentException("不是有效的 DVPL 文件（魔数不匹配）")
+            throw IllegalArgumentException(L.s(R.string.e_dvpl_magic))
         }
         
         // 解析尾部 20 字节
@@ -53,17 +55,17 @@ object DvplCodec {
         val compressionType = buffer.int
         // B2 双保险：footer 字段范围校验（native 层已校验，这里提前拦截省一次 JNI）
         if (originalSize < 0 || originalSize > 512 * 1024 * 1024) {
-            throw IllegalArgumentException("originalSize 非法：$originalSize")
+            throw IllegalArgumentException(L.s(R.string.tpl_bad_orig, originalSize))
         }
         if (compressedSize < 0 || compressedSize > input.size) {
-            throw IllegalArgumentException("compressedSize 非法：$compressedSize")
+            throw IllegalArgumentException(L.s(R.string.tpl_bad_comp, compressedSize))
         }
         
         // 提取数据部分
         val dataPart = input.sliceArray(0 until input.size - 20)
         
         if (dataPart.size != compressedSize) {
-            throw IllegalArgumentException("数据大小不匹配（期望 $compressedSize，实际 ${dataPart.size}）")
+            throw IllegalArgumentException(L.s(R.string.tpl_size_mismatch, compressedSize, dataPart.size))
         }
         
         // 验证 CRC32
@@ -71,7 +73,7 @@ object DvplCodec {
         crc32.update(dataPart)
         if (crc32.value.toInt() != crc32Value) {
             // F1 修复：损坏数据不应静默流入游戏，直接报错
-            throw IllegalArgumentException("CRC32 校验失败，文件数据已损坏")
+            throw IllegalArgumentException(L.s(R.string.e_crc))
         }
         
         // 根据压缩类型解压
@@ -86,7 +88,7 @@ object DvplCodec {
                 decompressDeflate(dataPart, originalSize)
             }
             else -> {
-                throw IllegalArgumentException("不支持的压缩类型: $compressionType")
+                throw IllegalArgumentException(L.s(R.string.tpl_comp_type, compressionType))
             }
         }
     }
@@ -120,7 +122,7 @@ object DvplCodec {
                 }
             }
             else -> {
-                throw IllegalArgumentException("不支持的压缩类型: $compressionType")
+                throw IllegalArgumentException(L.s(R.string.tpl_comp_type, compressionType))
             }
         }
         

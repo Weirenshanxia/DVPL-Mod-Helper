@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.ui
 
 import android.graphics.Bitmap
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
@@ -21,7 +23,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     @Volatile var textureDirty = true
     var isHdrRendered = false
         private set
-    var supportInfo = "初始化中..."
+    var supportInfo = L.s(R.string.x_init)
         private set
     var uploadFailed = false
         private set
@@ -103,7 +105,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         val hasLdr = exts.contains("GL_KHR_texture_compression_astc_ldr")
         val hasHdr = exts.contains("GL_KHR_texture_compression_astc_hdr")
         supportInfo = buildString {
-            append(if (hasLdr) "GPU 硬件 ASTC" else "无硬件 ASTC（软解）")
+            append(if (hasLdr) L.s(R.string.x_gpu_astc) else L.s(R.string.x_no_gpu_astc))
             append(if (hasHdr) " + HDR" else "")
         }
         GLES30.glClearColor(0.08f, 0.08f, 0.1f, 1f)

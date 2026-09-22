@@ -1,6 +1,8 @@
 package com.dvpl.modhelper.ui
 
 import android.content.Intent
+import com.dvpl.modhelper.L
+import com.dvpl.modhelper.R
 import android.graphics.Bitmap
 import android.net.Uri
 import android.opengl.GLSurfaceView
@@ -37,7 +39,7 @@ fun TexturePreviewScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var source by remember { mutableStateOf<TextureSource?>(null) }
-    var infoText by remember { mutableStateOf("解析中...") }
+    var infoText by remember { mutableStateOf(L.s(R.string.x_parsing)) }
     var exportBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var bgIndex by remember { mutableIntStateOf(0) }
@@ -52,7 +54,7 @@ fun TexturePreviewScreen(
         withContext(Dispatchers.IO) {
             try {
                 val raw = context.contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
-                    ?: throw IllegalStateException("无法读取文件")
+                    ?: throw IllegalStateException(L.s(R.string.e_cant_read))
                 // .pvr.dvpl / .dds.dvpl 自动解包（预览入口统一处理）
                 val data = if (DvplCodec.isDvplFile(raw))
                     try { DvplCodec.decode(raw) } catch (e: Exception) { raw }
@@ -60,7 +62,7 @@ fun TexturePreviewScreen(
                 fileBytes = data
                 if (PvrConverter.isPvrFile(data)) {
                     val info = PvrConverter.parse(data)
-                        ?: throw IllegalArgumentException("PVR 头解析失败")
+                        ?: throw IllegalArgumentException(L.s(R.string.e_pvr_hdr))
                     mipCount = info.mips
                     if (info.isAstc) {
                         // ASTC 压缩数据 GPU 直传
@@ -83,27 +85,27 @@ fun TexturePreviewScreen(
                     } else {
                         // 未压缩：软解全部 mips（mip 滑条可用）
                         val bmps = (0 until info.mips).mapNotNull { PvrConverter.decodeToBitmap(data, it) }
-                        if (bmps.isEmpty()) throw IllegalArgumentException("未压缩 PVR 解码失败")
+                        if (bmps.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_pvr_uncompressed))
                         source = TextureSource.DecodedBitmaps(bmps)
                         val csLabel2 = PvrConverter.getColorSpaceLabel(data)
-                        infoText = "PVR 未压缩  ${info.width}x${info.height}  ${bmps.size} mips" +
+                        infoText = L.s(R.string.tpl_pvr_info, info.width, info.height, bmps.size) +
                             (if (csLabel2.isNotEmpty()) "  $csLabel2" else "")
                         exportBitmap = bmps.first() // P6 优化：保留解码结果，导出时免二次解码
                         return@withContext
                     }
                 } else if (DdsConverter.isDdsFile(data)) {
                     val (bmp, format) = DdsConverter.decodeToBitmap(data)
-                        ?: throw IllegalArgumentException("DDS 解码失败（格式不支持）")
+                        ?: throw IllegalArgumentException(L.s(R.string.e_dds_fmt))
                     source = TextureSource.DecodedBitmaps(listOf(bmp))
                     val ddsCs = DdsConverter.getColorSpaceLabel(data)
                     infoText = "DDS ${DdsConverter.formatName(format)}  ${bmp.width}x${bmp.height}" +
                         (if (ddsCs.isNotEmpty()) "  $ddsCs" else "")
                     exportBitmap = bmp
                 } else {
-                    throw IllegalArgumentException("不支持的文件（仅 PVR/DDS）")
+                    throw IllegalArgumentException(L.s(R.string.e_only_pvr_dds))
                 }
             } catch (e: Exception) {
-                error = e.message ?: "解析失败"
+                error = e.message ?: L.s(R.string.x_parse_fail)
             }
         }
     }
@@ -111,9 +113,9 @@ fun TexturePreviewScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("纹理预览", style = MaterialTheme.typography.titleMedium) },
+                title = { Text(L.s(R.string.l_tex_preview), style = MaterialTheme.typography.titleMedium) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "返回") }
+                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, L.s(R.string.b_back)) }
                 },
                 actions = {
                     IconButton(onClick = {
@@ -130,7 +132,7 @@ fun TexturePreviewScreen(
                                         val name = fileName.substringBeforeLast(".") + "_preview.png"
                                         savePng(context, out.toByteArray(), name)
                                     } else {
-                                        "导出失败：无法解码"
+                                        L.s(R.string.e_export_decode)
                                     }
                                 } catch (e: Exception) {
                                     "导出失败: ${e.message}"
@@ -139,7 +141,7 @@ fun TexturePreviewScreen(
                             // C2 修复：Toast 在主线程
                             android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
                         }
-                    }) { Icon(Icons.Default.Download, "导出 PNG") }
+                    }) { Icon(Icons.Default.Download, L.s(R.string.b_export_png)) }
                 }
             )
         }
@@ -148,7 +150,7 @@ fun TexturePreviewScreen(
             when {
                 error != null -> {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("错误：$error", color = MaterialTheme.colorScheme.error)
+                        Text(L.s(R.string.tpl_error_colon, error ?: ""), color = MaterialTheme.colorScheme.error)
                     }
                 }
                 source == null -> {
@@ -213,7 +215,7 @@ fun TexturePreviewScreen(
                                                 source = TextureSource.DecodedBitmaps(listOf(soft))
                                                 mipCount = 1 // 软回退只有 mip0，隐藏滑条
                                                 exportBitmap = soft
-                                                infoText += "（GPU 不支持此格式，已软解回退）"
+                                                infoText += L.s(R.string.x_gpu_fallback)
                                             }
                                         }
                                     }
@@ -237,7 +239,7 @@ fun TexturePreviewScreen(
                             rendererRef?.bgColorIndex = bgIndex
                             glViewRef?.requestRender()
                         }) {
-                            Text("背景：" + listOf("黑", "灰", "白")[bgIndex], style = MaterialTheme.typography.labelMedium)
+                            Text(L.s(R.string.l_background) + listOf(L.s(R.string.bg_black), L.s(R.string.bg_gray), L.s(R.string.bg_white))[bgIndex], style = MaterialTheme.typography.labelMedium)
                         }
                         if (mipCount > 1) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -261,7 +263,7 @@ fun TexturePreviewScreen(
                             }
                         }
                         Text(
-                            "双指缩放/拖动，双击重置  （GPU 直传，无临时文件）",
+                            L.s(R.string.x_gesture_hint),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -283,14 +285,14 @@ private suspend fun savePng(context: android.content.Context, pngData: ByteArray
             }
             val uri = context.contentResolver.insert(
                 android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: return@withContext "导出失败：无法创建下载记录"
+                ?: return@withContext L.s(R.string.e_export_record)
             try {
                 context.contentResolver.openOutputStream(uri)?.use { it.write(pngData) }
-                    ?: throw IllegalStateException("写入失败")
+                    ?: throw IllegalStateException(L.s(R.string.e_write_fail))
                 values.clear()
                 values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
                 context.contentResolver.update(uri, values, null, null)
-                "已导出到 Download/DVPLModHelper"
+                L.s(R.string.x_exported)
             } catch (e: Exception) {
                 // F4 修复：失败删除 MediaStore 残留记录
                 context.contentResolver.delete(uri, null, null)

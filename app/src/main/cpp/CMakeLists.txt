@@ -82,17 +82,64 @@ target_link_libraries(pvr-codec
     z
 )
 
+
+# ===== libogg 静态库 =====
+file(GLOB LIBOGG_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libogg/*.c")
+add_library(libogg_static STATIC ${LIBOGG_SOURCES})
+target_include_directories(libogg_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/libogg/include)
+
+# ===== libvorbis 编码器静态库（不含 vorbisfile/psytune/barkmel/tone） =====
+set(LIBVORBIS_SOURCES
+    libvorbis/analysis.c
+    libvorbis/bitrate.c
+    libvorbis/block.c
+    libvorbis/codebook.c
+    libvorbis/envelope.c
+    libvorbis/floor0.c
+    libvorbis/floor1.c
+    libvorbis/info.c
+    libvorbis/lookup.c
+    libvorbis/lpc.c
+    libvorbis/lsp.c
+    libvorbis/mapping0.c
+    libvorbis/mdct.c
+    libvorbis/psy.c
+    libvorbis/registry.c
+    libvorbis/res0.c
+    libvorbis/sharedbook.c
+    libvorbis/smallft.c
+    libvorbis/synthesis.c
+    libvorbis/vorbisenc.c
+    libvorbis/window.c
+)
+foreach(src ${LIBVORBIS_SOURCES})
+    list(APPEND LIBVORBIS_SOURCES_ABS "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
+endforeach()
+add_library(libvorbis_static STATIC ${LIBVORBIS_SOURCES_ABS})
+target_include_directories(libvorbis_static PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/libvorbis/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/libvorbis
+    ${CMAKE_CURRENT_SOURCE_DIR}/libogg/include
+)
+target_compile_options(libvorbis_static PRIVATE -O2 -fvisibility=hidden)
+
 # ===== wwise（WEM → OGG，ww2ogg 0.24 by hcs，BSD 许可，源码零改动） =====
 add_library(wwise SHARED
     wwise_jni.cpp
+    vorbis_jni.cpp
     ww2ogg/wwriff.cpp
     ww2ogg/codebook.cpp
     ww2ogg/crc.c
 )
 
-target_include_directories(wwise PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ww2ogg)
+target_include_directories(wwise PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/ww2ogg
+    ${CMAKE_CURRENT_SOURCE_DIR}/libogg/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/libvorbis/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/libvorbis
+)
 
-target_link_libraries(wwise log)
+target_link_libraries(wwise log libogg_static libvorbis_static)
 
 # ===== dvpl-codec（DVPL LZ4 编解码，原有） =====
 add_library(dvpl-codec SHARED
