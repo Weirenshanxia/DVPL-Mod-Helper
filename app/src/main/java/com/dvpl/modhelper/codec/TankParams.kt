@@ -21,14 +21,17 @@ object TankParams {
         val gunPos: List<FloatArray> = emptyList()
     )
 
-    // 国服（网易）/ 国际服各发行包（internal: Wwise 音频包提取共用）
+    // 国服（网易各渠道/腾讯/4399）/ 国际服各发行包（internal: Wwise 音频包提取共用）
     internal val GAME_PKGS = arrayOf(
         "com.netease.wotb",
+        "com.netease.wotb.aligames",
+        "com.netease.wotb.huawei",
+        "com.netease.tksjsjz.yyxx.m4399",
+        "com.tencent.tmgp.yongyong.tksjsjz",
         "com.wargaming.wotblitz",
         "com.wargaming.wotblitz.eu",
         "com.wargaming.wotblitz.na",
-        "com.wargaming.wotblitz.asia",
-        "com.blitz470.priv"
+        "com.wargaming.wotblitz.asia"
     )
 
     // 车辆键(blitzModelPath 文件名) -> (包名, yaml asset 路径)

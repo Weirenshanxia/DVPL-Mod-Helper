@@ -4,11 +4,14 @@
     <!-- Android 11+ 包可见性：需要声明才能读到已安装游戏的 assets（官方参数命名用） -->
     <queries>
         <package android:name="com.netease.wotb" />
+        <package android:name="com.netease.wotb.aligames" />
+        <package android:name="com.netease.wotb.huawei" />
+        <package android:name="com.netease.tksjsjz.yyxx.m4399" />
+        <package android:name="com.tencent.tmgp.yongyong.tksjsjz" />
         <package android:name="com.wargaming.wotblitz" />
         <package android:name="com.wargaming.wotblitz.eu" />
         <package android:name="com.wargaming.wotblitz.na" />
         <package android:name="com.wargaming.wotblitz.asia" />
-        <package android:name="" />
     </queries>
 
     <!-- 使用 SAF 文件选择器，无需任何存储权限 -->
