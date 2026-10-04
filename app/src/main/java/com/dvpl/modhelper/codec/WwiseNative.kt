@@ -37,7 +37,7 @@ object WwiseNative {
      * WEM → OGG。返回 null 成功；否则返回错误信息（中文）。
      * wemFile/oggFile 均为本地文件路径（SAF Uri 需先拷到 cacheDir）。
      */
-    @Synchronized
+    // 无锁：native 每次调用使用独立实例与临时文件，无共享可变状态，可安全并发
     fun wemToOgg(wemFile: File, oggFile: File, codebook: File): String? {
         ensureLoaded()
         return wwemToOgg(wemFile.absolutePath, oggFile.absolutePath, codebook.absolutePath)

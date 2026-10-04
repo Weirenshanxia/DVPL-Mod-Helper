@@ -18,7 +18,8 @@ object DvplCodec {
     const val COMPRESSION_LZ4 = 1
     const val COMPRESSION_LZ4_HC = 2
     const val COMPRESSION_DEFLATE = 3
-    
+    const val COMPRESSION_LZ4_CHUNKED = 4
+
     // 魔数 "DVPL"
     private val MAGIC_BYTES = byteArrayOf(0x44, 0x56, 0x50, 0x4C) // "DVPL"
     
@@ -60,9 +61,14 @@ object DvplCodec {
         if (compressedSize < 0 || compressedSize > input.size) {
             throw IllegalArgumentException(L.s(R.string.tpl_bad_comp, compressedSize))
         }
-        
+
         // 提取数据部分
         val dataPart = input.sliceArray(0 until input.size - 20)
+
+        // type=4 分块 LZ4（新版游戏大文件格式）: footer 的 compSize/CRC 恒为 0，由内部索引描述
+        if (compressionType == COMPRESSION_LZ4_CHUNKED) {
+            return decodeChunkedLz4(dataPart, originalSize)
+        }
         
         if (dataPart.size != compressedSize) {
             throw IllegalArgumentException(L.s(R.string.tpl_size_mismatch, compressedSize, dataPart.size))
@@ -150,6 +156,60 @@ object DvplCodec {
         return output.toByteArray()
     }
     
+    /**
+     * type=4 分块 LZ4 解码（新版游戏大文件格式）
+     * 载荷结构: u32 块数, u32 索引区结束偏移(=首块起点),
+     *           每块 24 字节记录 (u64 保留, u32 compSize, u32 保留, u32 origSize[, u32 累积尾偏移]),
+     *           索引之后为顺序排列的独立 LZ4 块（通常每块解压到 256KB）
+     */
+    private fun decodeChunkedLz4(payload: ByteArray, originalSize: Int): ByteArray {
+        if (payload.size < 8) {
+            throw IllegalArgumentException(L.s(R.string.e_dvpl_small))
+        }
+        val count = u32(payload, 0)
+        val dataStart = u32(payload, 4)
+        if (count <= 0 || count > 65536) {
+            throw IllegalArgumentException("bad chunk count: " + count)
+        }
+        if (dataStart <= 8 || dataStart > payload.size) {
+            throw IllegalArgumentException("bad chunk index size: " + dataStart)
+        }
+        val out = ByteArray(originalSize)
+        var inPos = dataStart
+        var outPos = 0
+        for (i in 0 until count) {
+            val base = 8 + i * 24
+            if (base + 20 > dataStart) {
+                throw IllegalArgumentException("chunk index overrun at #" + i)
+            }
+            val compSize = u32(payload, base + 8)
+            val chunkOrig = u32(payload, base + 16)
+            if (compSize <= 0 || inPos + compSize > payload.size) {
+                throw IllegalArgumentException("bad chunk size at #" + i + ": " + compSize)
+            }
+            if (chunkOrig <= 0 || outPos + chunkOrig > originalSize) {
+                throw IllegalArgumentException("bad chunk orig size at #" + i + ": " + chunkOrig)
+            }
+            val block = payload.copyOfRange(inPos, inPos + compSize)
+            val dec = decompressLZ4Native(block, chunkOrig)
+            if (dec.size != chunkOrig) {
+                throw IllegalArgumentException("chunk #" + i + " decode mismatch: " + dec.size + "/" + chunkOrig)
+            }
+            System.arraycopy(dec, 0, out, outPos, chunkOrig)
+            inPos += compSize
+            outPos += chunkOrig
+        }
+        if (outPos != originalSize) {
+            throw IllegalArgumentException("chunked size mismatch: " + outPos + "/" + originalSize)
+        }
+        return out
+    }
+
+    /** 读 u32（小端） */
+    private fun u32(b: ByteArray, off: Int): Int =
+        (b[off].toInt() and 0xFF) or (b[off + 1].toInt() and 0xFF shl 8) or
+            (b[off + 2].toInt() and 0xFF shl 16) or (b[off + 3].toInt() and 0xFF shl 24)
+
     /**
      * 使用 Native 实现的 LZ4 解压
      */

@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.dvpl.modhelper
 
 import android.app.Activity
@@ -12,11 +14,17 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.lifecycle.lifecycleScope
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
@@ -43,6 +51,11 @@ import com.dvpl.modhelper.ui.PbrEditorScreen
 import com.dvpl.modhelper.ui.TexturePreviewScreen
 import com.dvpl.modhelper.ui.WemPlayerScreen
 import com.dvpl.modhelper.codec.PvrConverter
+import com.dvpl.modhelper.codec.ScgConverter
+import com.dvpl.modhelper.codec.TankParams
+import com.dvpl.modhelper.codec.WebpAnimMuxer
+import com.dvpl.modhelper.codec.WebpConverter
+import com.dvpl.modhelper.codec.WebpStrategy
 import com.dvpl.modhelper.codec.WwiseConverter
 import com.dvpl.modhelper.codec.WwiseNative
 import java.io.File
@@ -66,6 +79,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 启动预热官方参数索引（自检日志：能收录多少辆车）
+        lifecycleScope.launch(Dispatchers.IO) {
+            val n = try { TankParams.warmUp(applicationContext) } catch (e: Exception) { -1 }
+            android.util.Log.i("TankParams", "warmUp indexed=$n")
+        }
         setContent {
             DvplModHelperTheme {
                 Surface(
@@ -95,7 +113,11 @@ enum class ConvertMode(@androidx.annotation.StringRes val titleRes: Int, val sub
     WWISE_PACK(R.string.mode_ww_pack, "WwisePack"),
     WWISE_TO_OGG(R.string.mode_wem_ogg, "WwiseOgg"),
     WWISE_TO_WEM(R.string.mode_audio_wem, "AudioToWem"),
-    WWISE_PLAY(R.string.mode_wem_play, "WwisePlay")
+    WWISE_PLAY(R.string.mode_wem_play, "WwisePlay"),
+    WWISE_TEMPLATE(R.string.mode_ww_template, "WwiseTemplate"),
+    WWISE_PACK_FOLDER(R.string.mode_ww_pack_folder, "WwisePack"),
+    SCG_TO_OBJ(R.string.mode_scg_obj, "ScgToObj"),
+    TO_WEBP(R.string.mode_to_webp, "ToWebp")
 }
 
 /**
@@ -176,6 +198,20 @@ fun MainScreen() {
     // 批量处理明细记录
     var batchRecords by remember { mutableStateOf<List<Triple<String, Boolean, String>>>(emptyList()) }
     var showBatchDetail by remember { mutableStateOf(false) }
+
+    // ===== Wwise 打包模板 / 文件夹打包 =====
+    var templateSel by remember { mutableStateOf<List<Pair<Uri, String>>?>(null) }
+    var showTemplateDialog by remember { mutableStateOf(false) }
+    var templateIncludeAudio by remember { mutableStateOf(false) }
+    var packBankSel by remember { mutableStateOf<List<Pair<Uri, String>>>(emptyList()) }
+    var packPlans by remember { mutableStateOf<List<PackPlan>>(emptyList()) }
+    var showPackPreview by remember { mutableStateOf(false) }
+
+    // ===== SCG -> OBJ 模型导出（先解析 → 部件选择对话框 → 导出）=====
+    var scgParsed by remember { mutableStateOf<ScgParsed?>(null) }
+    var showScgDialog by remember { mutableStateOf(false) }
+    var scgLodMode by rememberSaveable { mutableStateOf(1) }   // LOD 快速预设：1=仅LOD0 2=LOD0-1 0=全部
+
     // 滚动位置保持（预览返回不回顶）
     val mainScrollState = rememberSaveable(saver = androidx.compose.foundation.ScrollState.Saver) {
         androidx.compose.foundation.ScrollState(0)
@@ -183,6 +219,16 @@ fun MainScreen() {
     var ddsFormat by rememberSaveable { mutableStateOf(DdsConverter.DdsFormat.BC3) }
     // 色彩空间：true=线性（NM/RM/MISC/MASK 数据贴图），false=sRGB（BC/ALBEDO/CM 颜色贴图）
     var isLinear by rememberSaveable { mutableStateOf(false) }
+    // 法线输出 images_pbr 灰度版（游戏 pbr 目录 NM 为灰度单标量格式）
+    var nmPbrGray by rememberSaveable { mutableStateOf(false) }
+    // WebP 输出设置: 0=自动(无损/有损取更小) 1=有损 2=无损; 质量; 视频帧率/最长边
+    var webpStrategyIdx by rememberSaveable { mutableStateOf(0) }
+    var webpQuality by rememberSaveable { mutableStateOf(75) }
+    var webpFps by rememberSaveable { mutableStateOf(10) }
+    var webpMaxSide by rememberSaveable { mutableStateOf(720) }
+    // WebP 模式: 先选文件, 再弹专属选项对话框
+    var showWebpDialog by remember { mutableStateOf(false) }
+    var pendingWebpUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var showQualityDialog by remember { mutableStateOf(false) }
 
     // 导出目录状态
@@ -248,9 +294,82 @@ fun MainScreen() {
         uri?.let { pbrEditFile = Pair(it, queryFileName(context, it)) }
     }
 
+    // Wwise 按模板打包：先选库文件（走 multipleFilesLauncher），processFiles 拦截后再调这里选文件夹
+    val sourceFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri == null) return@rememberLauncherForActivityResult
+        val bankSel = packBankSel
+        if (bankSel.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            isProcessing = true
+            processingStatus = L.s(R.string.x_scanning)
+            try {
+                val jsonUris = bankSel.filter { it.second.contains("soundbanksinfo", true) }.map { it.first }
+                val banks = bankSel.filterNot { it.second.contains("soundbanksinfo", true) }
+                if (banks.isEmpty()) { resultMessage = L.s(R.string.e_no_pck); return@launch }
+                val info = collectSoundbanksInfo(context, jsonUris)
+                val plans = buildPackPlans(context, banks, treeUri, info) { msg ->
+                    scope.launch { processingStatus = msg }
+                }
+                packPlans = plans
+                showPackPreview = true
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                resultMessage = e.message ?: e.javaClass.simpleName
+            } finally { isProcessing = false }
+        }
+    }
+
     // ===== 统一的 SAF 多文件选择器（系统文件选择器，不调起媒体库） =====
     // 统一批量处理入口（文件选择器和文件夹导入共用）
     fun processFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        // 新流程拦截：不走通用批量管线
+        if (pendingMode == ConvertMode.WWISE_TEMPLATE) {
+            templateSel = uris.map { Pair(it, queryFileName(context, it)) }
+            templateIncludeAudio = false
+            showTemplateDialog = true
+            return
+        }
+        if (pendingMode == ConvertMode.WWISE_PACK_FOLDER) {
+            packBankSel = uris.map { Pair(it, queryFileName(context, it)) }
+            sourceFolderLauncher.launch(null)
+            return
+        }
+        // SCG 模型导出：第一个 .scg 是本体, 其余 .scg(涂装外挂件/其他 scg)全部拼接进来
+        if (pendingMode == ConvertMode.SCG_TO_OBJ) {
+            val names = uris.map { Pair(it, queryFileName(context, it)) }
+            val scgPick = names.filter { it.second.contains(".scg", true) }
+            val sc2Pick = names.filter { it.second.contains(".sc2", true) }
+            // 文件名不含 .scg 但只选了一个文件时也照收（部分文件管理器会改名）
+            val scgEntry = scgPick.firstOrNull() ?: if (uris.size == 1) names.first() else null
+            if (scgEntry == null) {
+                resultMessage = L.s(R.string.e_scg_parse)
+                return
+            }
+            val scgUri = scgEntry.first
+            val scgName = scgEntry.second
+            val sc2Uri = sc2Pick.firstOrNull()?.first
+            // 手动多选: 除第一个外全部作为附加件（涂装 3D 件等, 同世界坐标系直接拼接）
+            val extraScgs = names.filter { it.second.contains(".scg", true) && it.first != scgUri }
+                .map { it.second to it.first }
+            scope.launch {
+                isProcessing = true
+                processingStatus = L.s(R.string.x_processing_n, 1)
+                try {
+                    scgParsed = withContext(Dispatchers.IO) { parseScgForDialog(context, scgUri, sc2Uri, scgName, extraScgs) }
+                    showScgDialog = true
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    android.util.Log.e("ScgConvert", "scg flow failed", e)
+                    val loc = e.stackTrace.firstOrNull { it.className.contains("com.dvpl") }
+                        ?.let { it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber } ?: "?"
+                    resultMessage = (e.message ?: e.javaClass.simpleName) + " @" + loc
+                } finally { isProcessing = false }
+            }
+            return
+        }
         if (uris.isNotEmpty()) {
             scope.launch {
                 isProcessing = true
@@ -262,6 +381,11 @@ fun MainScreen() {
                     val ddsFmt = ddsFormat
                     val groupByType = groupByType
                     val linear = isLinear
+                    val nmPbr = nmPbrGray
+                    val webpStrategy = WebpStrategy.values()[webpStrategyIdx]
+                    val webpQ = webpQuality
+                    val webpFpsSel = webpFps
+                    val webpMaxSideSel = webpMaxSide
                     // P1 优化：并行处理（4 并发，保序）+ C3 修复：协作式取消
                     val results = withContext(Dispatchers.IO) {
                         if (mode == ConvertMode.WWISE_UNPACK || mode == ConvertMode.WWISE_PACK ||
@@ -273,9 +397,11 @@ fun MainScreen() {
                         // DVPL 模式无 Bitmap 分配，直接用并发 4 跑满 IO；纹理模式走信号量动态限流
                         val isBitmapMode = mode == ConvertMode.DDS_TO_PNG || mode == ConvertMode.PNG_TO_DDS ||
                             mode == ConvertMode.DDS_TO_PVR || mode == ConvertMode.PVR_TO_DDS ||
-                            mode == ConvertMode.PVR_TO_PNG || mode == ConvertMode.PNG_TO_PVR
+                            mode == ConvertMode.PVR_TO_PNG || mode == ConvertMode.PNG_TO_PVR ||
+                            mode == ConvertMode.TO_WEBP
                         // java.util.concurrent.Semaphore 支持 acquire(n)/release(n) 原子操作，用于按 Bitmap 大小限流
                         val bitmapSem = java.util.concurrent.Semaphore(20)
+                        val videoSem = java.util.concurrent.Semaphore(1)   // 视频逐帧解码串行（防 OOM）
                         val dispatcher = Dispatchers.IO.limitedParallelism(4)
                         kotlinx.coroutines.coroutineScope {
                         uris.map { uri ->
@@ -283,11 +409,15 @@ fun MainScreen() {
                             var fName = ""
                             try {
                                 currentCoroutineContext().ensureActive() // C3：取消检查
-                                val input = context.contentResolver.openInputStream(uri)
-                                    ?: throw IllegalStateException(L.s(R.string.e_cant_read))
-                                val inputData = input.use { it.readBytes() }
                                 val fileName = queryFileName(context, uri)
                                 fName = fileName
+                                // TO_WEBP 视频走 Uri 直读（MediaMetadataRetriever），不整读进内存
+                                val isVideoW = mode == ConvertMode.TO_WEBP && isVideoFile(context, uri, fileName)
+                                val inputData = if (isVideoW) ByteArray(0) else {
+                                    val input = context.contentResolver.openInputStream(uri)
+                                        ?: throw IllegalStateException(L.s(R.string.e_cant_read))
+                                    input.use { it.readBytes() }
+                                }
 
                                 val outputData: ByteArray
                                 val outputName: String
@@ -306,7 +436,7 @@ fun MainScreen() {
                                         val estBytes0 = if (info0 != null) info0.width.toLong() * info0.height * 4 else 16L * 1024 * 1024
                                         val permits0 = maxOf(1, minOf(20, (estBytes0 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits0)
-                                        val bitmap = try {
+                                        var bitmap = try {
                                             PvrConverter.decodeToBitmap(inputData)
                                                 ?: run {
                                                     bitmapSem.release(permits0)
@@ -314,6 +444,9 @@ fun MainScreen() {
                                                         (info0?.let { "（ASTC " + it.blockW + "x" + it.blockH + " " + it.width + "x" + it.height + L.s(R.string.x_see_log) } ?: L.s(R.string.x_fmt_unsupported)))
                                                 }
                                         } catch (e: Exception) { bitmapSem.release(permits0); throw e }
+                                        // 法线贴图: 存储值即标准线性编码(2026-10 重验)；pbr 灰度版(RGB=X,A=Y)还原标准色
+                                        if (PvrConverter.isNormalMapName(fileName) && PvrConverter.isPbrGrayNormalMap(bitmap))
+                                            bitmap = PvrConverter.fromPbrGrayNormalMap(bitmap)
                                         val out = java.io.ByteArrayOutputStream()
                                         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
                                         bitmap.recycle()
@@ -333,11 +466,17 @@ fun MainScreen() {
                                         val estBytes1 = opts.outWidth.toLong() * opts.outHeight * 4
                                         val permits1 = maxOf(1, minOf(20, (estBytes1 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits1)
-                                        val bitmap = try {
-                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
+                                        var bitmap = try {
+                                            // inPremultiplied=false: PNG 半透明区域解码为直通 alpha, 编码进 PVR 不被压暗
+                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size,
+                                                android.graphics.BitmapFactory.Options().apply { inPremultiplied = false })
                                                 ?: throw IllegalArgumentException(L.s(R.string.e_png_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits1); throw e }
-                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
+                                        // 法线贴图: 存储值即标准法线值(线性)，仅强制线性色彩空间
+                                        val nm1 = PvrConverter.isNormalMapName(fileName)
+                                        // images_pbr 目录版本: 灰度 RGB=X + A=Y 双标量（实测 IS-3/E-100 track）
+                                        if (nm1 && nmPbr) bitmap = PvrConverter.toPbrGrayNormalMap(bitmap)
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, nm1 || linear) } finally { bitmap.recycle(); bitmapSem.release(permits1) }
                                         outputName = retagFileName(fileName, pvrTag(quality))
                                     }
                                     ConvertMode.DDS_TO_PNG -> {
@@ -348,7 +487,7 @@ fun MainScreen() {
                                         val permits2 = maxOf(1, minOf(20, (estBytes2 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits2)
                                         val (bitmap, _) = try {
-                                            DdsConverter.decodeToBitmap(inputData)
+                                            DdsConverter.decodeToBitmap(inputData, fileName)
                                                 ?: throw IllegalArgumentException(L.s(R.string.e_dds_fmt))
                                         } catch (e: Exception) { bitmapSem.release(permits2); throw e }
                                         val out = java.io.ByteArrayOutputStream()
@@ -370,10 +509,15 @@ fun MainScreen() {
                                         val estBytes3 = opts.outWidth.toLong() * opts.outHeight * 4
                                         val permits3 = maxOf(1, minOf(20, (estBytes3 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits3)
-                                        val bitmap = try {
-                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size)
+                                        var bitmap = try {
+                                            // inPremultiplied=false: 直通 alpha, 编码进 DDS 不被压暗
+                                            android.graphics.BitmapFactory.decodeByteArray(inputData, 0, inputData.size,
+                                                android.graphics.BitmapFactory.Options().apply { inPremultiplied = false })
                                                 ?: throw IllegalArgumentException(L.s(R.string.e_png_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits3); throw e }
+                                        // PC 端 DXT5nm: 标准法线 → R=255,G=Y,B=0,A=X 摆放
+                                        if (PvrConverter.isNormalMapName(fileName) && ddsFmt == DdsConverter.DdsFormat.BC3)
+                                            bitmap = DdsConverter.swizzleToDxt5nm(bitmap)
                                         outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits3) }
                                         outputName = retagFileName(fileName, ".dx11.dds")
                                     }
@@ -383,11 +527,17 @@ fun MainScreen() {
                                         val estBytes4 = ddsW4.toLong() * ddsH4 * 4
                                         val permits4 = maxOf(1, minOf(20, (estBytes4 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits4)
-                                        val (bitmap, _) = try {
-                                            DdsConverter.decodeToBitmap(inputData)
+                                        var (bitmap, _) = try {
+                                            DdsConverter.decodeToBitmap(inputData, fileName)
                                                 ?: throw IllegalArgumentException(L.s(R.string.e_dds_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits4); throw e }
-                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, linear) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
+                                        // 法线贴图: PC DDS 存储值即标准法线值(线性)，直传 + 强制线性
+                                        val nm4 = PvrConverter.isNormalMapName(fileName)
+                                        // images_pbr 目录版本: 灰度 RGB=X + A=Y 双标量（实测 IS-3/E-100 track）
+                                        if (nm4 && nmPbr) bitmap = PvrConverter.toPbrGrayNormalMap(bitmap)
+                                        // 色彩空间自动: 按源 DDS 头/贴图类型（DX10 _SRGB→sRGB；旧式头按 NM/RM→线性、底图→sRGB）
+                                        val autoLin4 = DdsConverter.detectDdsLinear(inputData, fileName)
+                                        outputData = try { PvrConverter.encodeToPvr(bitmap, quality, nm4 || autoLin4) } finally { bitmap.recycle(); bitmapSem.release(permits4) }
                                         outputName = retagFileName(fileName, pvrTag(quality))
                                     }
                                     ConvertMode.PVR_TO_DDS -> {
@@ -395,12 +545,95 @@ fun MainScreen() {
                                         val estBytes5 = if (info5 != null) info5.width.toLong() * info5.height * 4 else 16L * 1024 * 1024
                                         val permits5 = maxOf(1, minOf(20, (estBytes5 / (10L * 1024 * 1024)).toInt() + 1))
                                         bitmapSem.acquire(permits5)
-                                        val bitmap = try {
+                                        var bitmap = try {
                                             PvrConverter.decodeToBitmap(inputData)
                                                 ?: throw IllegalArgumentException(L.s(R.string.e_pvr_decode))
                                         } catch (e: Exception) { bitmapSem.release(permits5); throw e }
-                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, linear) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
+                                        // 法线贴图: 存储值即标准线性编码(2026-10 重验)；pbr 灰度版(RGB=X,A=Y)还原标准色
+                                        if (PvrConverter.isNormalMapName(fileName) && PvrConverter.isPbrGrayNormalMap(bitmap))
+                                            bitmap = PvrConverter.fromPbrGrayNormalMap(bitmap)
+                                        // PC 端 DXT5nm: 标准法线 → R=255,G=Y,B=0,A=X 摆放
+                                        if (PvrConverter.isNormalMapName(fileName) && ddsFmt == DdsConverter.DdsFormat.BC3)
+                                            bitmap = DdsConverter.swizzleToDxt5nm(bitmap)
+                                        // 色彩空间自动: 按源 PVR 头 cs 标志
+                                        val autoLin5 = PvrConverter.isLinearPvr(inputData) ?: linear
+                                        outputData = try { DdsConverter.encodeToDds(bitmap, ddsFmt, autoLin5) } finally { bitmap.recycle(); bitmapSem.release(permits5) }
                                         outputName = retagFileName(fileName, ".dx11.dds")
+                                    }
+                                    ConvertMode.TO_WEBP -> {
+                                        if (isVideoW) {
+                                            // 视频 → 动画 WebP（Uri 直读逐帧解码, videoSem 串行防 OOM）
+                                            videoSem.acquire()
+                                            try {
+                                                val retriever = android.media.MediaMetadataRetriever()
+                                                try {
+                                                    retriever.setDataSource(context, uri)
+                                                    val durMs = retriever.extractMetadata(
+                                                        android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                                                        ?: throw IllegalArgumentException(L.s(R.string.e_video_meta))
+                                                    val delayMs = (1000 / webpFpsSel).coerceAtLeast(1)
+                                                    val maxFrames = (durMs / delayMs).toInt().coerceAtLeast(1)
+                                                    val frames = ArrayList<WebpAnimMuxer.Frame>(minOf(maxFrames, 512))
+                                                    var canvasW = 0; var canvasH = 0
+                                                    // 帧数据字节预算: 混流需全帧驻留内存, 限总量而非帧数(约等于旧 300 帧上限的典型体积)
+                                                    var framesBytes = 0L
+                                                    val framesBudget = 32L * 1024 * 1024
+                                                    fun addFrame(bmp: android.graphics.Bitmap): Boolean {
+                                                        if (canvasW == 0) { canvasW = bmp.width; canvasH = bmp.height }
+                                                        val webp = WebpConverter.encodeFrame(bmp, webpQ)
+                                                        bmp.recycle()
+                                                        framesBytes += webp.size
+                                                        frames.add(WebpAnimMuxer.Frame(webp, delayMs))
+                                                        return framesBytes < framesBudget
+                                                    }
+                                                    // 快路径: MediaCodec 顺序硬解抽帧（典型 3~10 倍速），失败回退 retriever
+                                                    val fastOk = WebpConverter.extractVideoFramesFast(
+                                                        context, uri, webpFpsSel, webpMaxSideSel, maxFrames
+                                                    ) { bmp -> addFrame(bmp) }
+                                                    if (!fastOk) {
+                                                        for (i in 0 until maxFrames) {
+                                                            currentCoroutineContext().ensureActive()
+                                                            val frame = retriever.getFrameAtTime(
+                                                                i.toLong() * delayMs * 1000L,
+                                                                android.media.MediaMetadataRetriever.OPTION_CLOSEST)
+                                                                ?: break   // 尾部帧解不出 → 用已取到的帧收尾
+                                                            var scaled = frame
+                                                            val longSide = maxOf(frame.width, frame.height)
+                                                            if (webpMaxSideSel in 1 until longSide) {
+                                                                val scale = webpMaxSideSel.toFloat() / longSide
+                                                                scaled = android.graphics.Bitmap.createScaledBitmap(frame,
+                                                                    maxOf(1, (frame.width * scale).toInt()),
+                                                                    maxOf(1, (frame.height * scale).toInt()), true)
+                                                                frame.recycle()
+                                                            }
+                                                            if (!addFrame(scaled)) break
+                                                        }
+                                                    }
+                                                    if (frames.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_video_frames))
+                                                    outputData = WebpAnimMuxer.mux(frames, canvasW, canvasH)
+                                                } finally {
+                                                    retriever.release()
+                                                }
+                                            } finally {
+                                                videoSem.release()
+                                            }
+                                            outputName = retagFileName(fileName, ".webp")
+                                        } else {
+                                            // 图像 → 静态 WebP: dvpl包裹/PVR/DDS/平台格式; 按解码内存申请 permits
+                                            val estBytesW = WebpConverter.estimateDecodeBytes(inputData)
+                                            val permitsW = maxOf(1, minOf(20, (estBytesW / (10L * 1024 * 1024)).toInt() + 1))
+                                            bitmapSem.acquire(permitsW)
+                                            var bitmap = try {
+                                                WebpConverter.decodeToBitmap(inputData, fileName)
+                                                    ?: throw IllegalArgumentException(L.s(R.string.e_img_decode))
+                                            } catch (e: Exception) { bitmapSem.release(permitsW); throw e }
+                                            // 法线贴图: pbr 灰度版(RGB=X,A=Y)还原标准色（与 PVR_TO_PNG 一致）
+                                            if (PvrConverter.isNormalMapName(fileName) && PvrConverter.isPbrGrayNormalMap(bitmap))
+                                                bitmap = PvrConverter.fromPbrGrayNormalMap(bitmap)
+                                            outputData = try { WebpConverter.encodeImage(bitmap, webpStrategy, webpQ) }
+                                                finally { bitmap.recycle(); bitmapSem.release(permitsW) }
+                                            outputName = retagFileName(fileName, ".webp")
+                                        }
                                     }
                                     else -> throw IllegalStateException(L.s(R.string.e_internal_wise))
                                 }
@@ -446,7 +679,15 @@ fun MainScreen() {
         // SAF OpenMultipleDocuments：实测 GET_CONTENT 在部分 ColorOS 15 上黑屏 ANR（PhotoPicker 路由 bug），SAF 稳定
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        if (uris.isNotEmpty()) processFiles(uris)
+        if (uris.isNotEmpty()) {
+            // WebP 模式: 先选文件，再弹专属选项对话框
+            if (pendingMode == ConvertMode.TO_WEBP) {
+                pendingWebpUris = uris
+                showWebpDialog = true
+            } else {
+                processFiles(uris)
+            }
+        }
     }
 
     // ===== WEM 试听（仿纹理预览交互）=====
@@ -497,7 +738,7 @@ fun MainScreen() {
                 )
             },
             text = {
-                Column {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                     if (pendingMode == ConvertMode.PNG_TO_PVR || pendingMode == ConvertMode.DDS_TO_PVR) {
                         PvrConverter.AstcQuality.values().forEach { q ->
                             Row(
@@ -529,32 +770,53 @@ fun MainScreen() {
                             }
                         }
                     }
-                    // 色彩空间选项（颜色贴图 vs 数据贴图）
+                    // 色彩空间：DDS↔PVR 自动按源文件识别；PNG 来源无头部信息，手动选
                     androidx.compose.material3.Divider(modifier = Modifier.padding(vertical = 8.dp))
-                    Text(L.s(R.string.l_colorspace), style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.padding(bottom = 4.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(selected = !isLinear, onClick = { isLinear = false })
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text(L.s(R.string.l_cs_albedo))
-                            Text(L.s(R.string.l_cs_albedo_hint),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (pendingMode == ConvertMode.DDS_TO_PVR || pendingMode == ConvertMode.PVR_TO_DDS) {
+                        Text(L.s(R.string.l_cs_auto), style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(bottom = 4.dp))
+                    } else {
+                        Text(L.s(R.string.l_colorspace), style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(bottom = 4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(selected = !isLinear, onClick = { isLinear = false })
+                            Column(modifier = Modifier.padding(start = 8.dp)) {
+                                Text(L.s(R.string.l_cs_albedo))
+                                Text(L.s(R.string.l_cs_albedo_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(selected = isLinear, onClick = { isLinear = true })
+                            Column(modifier = Modifier.padding(start = 8.dp)) {
+                                Text(L.s(R.string.l_cs_data))
+                                Text(L.s(R.string.l_cs_data_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                     }
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(selected = isLinear, onClick = { isLinear = true })
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text(L.s(R.string.l_cs_data))
-                            Text(L.s(R.string.l_cs_data_hint),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // 法线 → images_pbr 灰度版（仅 PVR 输出模式显示）
+                    if (pendingMode == ConvertMode.PNG_TO_PVR || pendingMode == ConvertMode.DDS_TO_PVR) {
+                        androidx.compose.material3.Divider(modifier = Modifier.padding(vertical = 8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(checked = nmPbrGray, onCheckedChange = { nmPbrGray = it })
+                            Column(modifier = Modifier.padding(start = 8.dp)) {
+                                Text(L.s(R.string.nm_pbr_gray))
+                                Text(L.s(R.string.nm_pbr_gray_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                     }
                 }
@@ -567,6 +829,78 @@ fun MainScreen() {
             },
             dismissButton = {
                 TextButton(onClick = { showQualityDialog = false }) { Text(L.s(R.string.b_cancel)) }
+            }
+        )
+    }
+
+    // ===== WebP 转换选项（先选文件后弹，图像/视频混批通用）=====
+    if (showWebpDialog) {
+        AlertDialog(
+            onDismissRequest = { showWebpDialog = false },
+            title = { Text(L.s(R.string.webp_opts_title)) },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text(L.s(R.string.webp_mixed_hint), style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // 压缩策略
+                    Text(L.s(R.string.webp_strategy), style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(top = 12.dp, bottom = 4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf(0 to R.string.webp_strat_auto, 1 to R.string.webp_strat_lossy,
+                               2 to R.string.webp_strat_lossless).forEach { (idx, res) ->
+                            FilterChip(selected = webpStrategyIdx == idx,
+                                onClick = { webpStrategyIdx = idx },
+                                label = { Text(L.s(res)) })
+                        }
+                    }
+                    if (webpStrategyIdx == 0)
+                        Text(L.s(R.string.webp_strat_auto_hint), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 2.dp))
+                    // 质量
+                    Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Text(L.s(R.string.webp_quality), style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.weight(1f))
+                        Text(webpQuality.toString() + "%", style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    }
+                    Slider(value = webpQuality.toFloat(),
+                        onValueChange = { webpQuality = it.toInt().coerceIn(25, 100) },
+                        valueRange = 25f..100f, steps = 74)
+                    Text(L.s(R.string.webp_quality_hint), style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // 视频参数（混批时仅对视频文件生效）
+                    androidx.compose.material3.Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text(L.s(R.string.webp_fps), style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(bottom = 4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf(5, 10, 15, 24).forEach { f ->
+                            FilterChip(selected = webpFps == f, onClick = { webpFps = f },
+                                label = { Text(f.toString() + " fps") })
+                        }
+                    }
+                    Text(L.s(R.string.webp_maxside), style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf(480, 720, 1080, 0).forEach { s ->
+                            FilterChip(selected = webpMaxSide == s, onClick = { webpMaxSide = s },
+                                label = { Text(if (s == 0) L.s(R.string.webp_side_orig) else s.toString()) })
+                        }
+                    }
+                    Text(L.s(R.string.webp_video_hint), style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 2.dp))
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showWebpDialog = false
+                    processFiles(pendingWebpUris)
+                }) { Text(L.s(R.string.b_confirm)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showWebpDialog = false }) { Text(L.s(R.string.b_cancel)) }
             }
         )
     }
@@ -598,6 +932,255 @@ fun MainScreen() {
             },
             confirmButton = {
                 TextButton(onClick = { showBatchDetail = false }) { Text(L.s(R.string.b_close)) }
+            }
+        )
+    }
+
+    // ===== 模板导出对话框 =====
+    if (showTemplateDialog && templateSel != null) {
+        val sel = templateSel!!
+        val hasJson = sel.any { it.second.contains("soundbanksinfo", true) }
+        AlertDialog(
+            onDismissRequest = { showTemplateDialog = false },
+            title = { Text(L.s(R.string.tpl_dialog_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(sel.joinToString("\n") { it.second },
+                        style = MaterialTheme.typography.bodySmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(L.s(R.string.tpl_opt_include_audio),
+                                style = MaterialTheme.typography.bodyMedium)
+                            Text(L.s(R.string.tpl_opt_include_audio_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = templateIncludeAudio,
+                            onCheckedChange = { templateIncludeAudio = it }
+                        )
+                    }
+                    if (!hasJson) Text(L.s(R.string.tpl_need_json),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showTemplateDialog = false
+                    val banks = sel.filterNot { it.second.contains("soundbanksinfo", true) }
+                    val jsons = sel.filter { it.second.contains("soundbanksinfo", true) }.map { it.first }
+                    val includeAudio = templateIncludeAudio
+                    val dirUri = outputDirUri
+                    scope.launch {
+                        isProcessing = true
+                        processingStatus = L.s(R.string.x_template_started)
+                        try {
+                            val info = collectSoundbanksInfo(context, jsons)
+                            val res = exportPackTemplate(context, banks, info, includeAudio, dirUri, "WwisePackTemplate")
+                            resultMessage = L.s(R.string.x_tpl_done) +
+                                res.joinToString("、") { it.dirName } +
+                                res.sumOf { it.folders }.toString() +
+                                L.s(R.string.x_tpl_files)
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            resultMessage = e.message ?: e.javaClass.simpleName
+                        } finally { isProcessing = false }
+                    }
+                }) { Text(L.s(R.string.b_export_template)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTemplateDialog = false }) { Text(L.s(R.string.b_cancel)) }
+            }
+        )
+    }
+
+    // ===== SCG -> OBJ 部件选择对话框（LOD 只是快速预设，配件勾选独立）=====
+    if (showScgDialog && scgParsed != null) {
+        val parsed = scgParsed!!
+        // 勾选状态；LOD 预设/全选/全不选都会整体重置它
+        var scgSelected by remember(parsed) {
+            mutableStateOf(scgDefaultSelection(parsed.groups, scgLodMode))
+        }
+        // 长按部件进入单独预览（不改勾选状态），再次长按/点提示条退出
+        var scgSoloId by remember(parsed) { mutableStateOf<Long?>(null) }
+        AlertDialog(
+            onDismissRequest = { showScgDialog = false },
+            title = { Text(L.s(R.string.scg_dlg_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(parsed.fileName, style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    // sc2 配件名状态
+                    Text(
+                        if (parsed.namesFound) L.s(R.string.scg_names_found) else L.s(R.string.scg_names_missing),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (parsed.namesFound) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(L.s(R.string.scg_lod_label), style = MaterialTheme.typography.labelMedium)
+                    listOf(1, 2, 0).forEach { mode ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                scgLodMode = mode
+                                scgSelected = scgDefaultSelection(parsed.groups, mode)
+                            }
+                        ) {
+                            RadioButton(selected = scgLodMode == mode, onClick = null)
+                            Text(
+                                when (mode) {
+                                    1 -> L.s(R.string.scg_lod_0)
+                                    2 -> L.s(R.string.scg_lod_01)
+                                    else -> L.s(R.string.scg_lod_all)
+                                },
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(L.s(R.string.scg_selected, scgSelected.size, parsed.groups.size),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f))
+                        TextButton(onClick = { scgSelected = parsed.groups.map { it.id }.toSet() }) {
+                            Text(L.s(R.string.scg_sel_all)) }
+                        TextButton(onClick = { scgSelected = emptySet() }) {
+                            Text(L.s(R.string.scg_sel_none)) }
+                    }
+                    // 3D 预览（OpenGL）：勾选组实心、其余幽灵灰；长按列表项可单独预览
+                    Box(Modifier.fillMaxWidth().height(230.dp)) {
+                        AndroidView(
+                            factory = { ctx -> ScgGlView(ctx).apply { setScene(parsed.groups) } },
+                            update = { it.setDisplay(scgSelected, scgSoloId) },
+                            onRelease = { it.onPause() },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        val soloGroup = scgSoloId?.let { id -> parsed.groups.firstOrNull { it.id == id } }
+                        if (soloGroup != null) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.align(Alignment.TopStart).padding(6.dp).clickable { scgSoloId = null }
+                            ) {
+                                Text(
+                                    L.s(R.string.scg_solo_chip, soloGroup.name ?: ("#" + soloGroup.id)),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        } else {
+                            Text(L.s(R.string.scg_preview_hint),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)
+                            )
+                        }
+                    }
+                    // 配件清单：按类别分组（车体/炮塔/火炮/行走机构…），名字 + 顶点数 + LOD
+                    val byCat = parsed.groups.groupBy { scgCategory(it) }.toSortedMap()
+                    LazyColumn(Modifier.heightIn(max = 200.dp)) {
+                        for ((cat, catGroups) in byCat) {
+                            item(key = "cat$cat".hashCode().toLong()) {
+                                Text(
+                                    L.s(scgCategoryLabel(cat)) + " · " + catGroups.size,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(top = 6.dp, bottom = 2.dp)
+                                )
+                            }
+                            items(catGroups.sortedByDescending { it.vertexCount }, key = { it.id }) { g ->
+                                val checked = g.id in scgSelected
+                                val soloed = g.id == scgSoloId
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                        .background(
+                                            if (soloed) MaterialTheme.colorScheme.primaryContainer
+                                            else androidx.compose.ui.graphics.Color.Transparent
+                                        )
+                                        .combinedClickable(
+                                            onClick = {
+                                                scgSelected = if (checked) scgSelected - g.id else scgSelected + g.id
+                                            },
+                                            onLongClick = {
+                                                scgSoloId = if (soloed) null else g.id
+                                            }
+                                        )
+                                ) {
+                                    Checkbox(checked = checked, onCheckedChange = null)
+                                    Text(
+                                        (g.name ?: ("#" + g.id)) +
+                                            (if (g.vertexCount <= 3) "  [" + L.s(R.string.scg_marker) + "]" else "  (" + g.vertexCount + "v)") +
+                                            (if (g.lod > 0) "  LOD" + g.lod else "") +
+                                            (if (soloed) "  ●" else ""),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showScgDialog = false
+                    val sel = scgSelected
+                    val dirUri = outputDirUri
+                    val groupByTypeNow = groupByType
+                    scope.launch {
+                        isProcessing = true
+                        processingStatus = L.s(R.string.x_processing_n, 1)
+                        try {
+                            resultMessage = processScg(context, parsed, sel, dirUri, groupByTypeNow)
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            android.util.Log.e("ScgConvert", "scg export failed", e)
+                            val loc = e.stackTrace.firstOrNull { it.className.contains("com.dvpl") }
+                                ?.let { it.className.substringAfterLast('.') + "." + it.methodName + ":" + it.lineNumber } ?: "?"
+                            resultMessage = (e.message ?: e.javaClass.simpleName) + " @" + loc
+                        } finally { isProcessing = false }
+                    }
+                }) { Text(L.s(R.string.scg_export)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showScgDialog = false }) { Text(L.s(R.string.b_cancel)) }
+            }
+        )
+    }
+
+    // ===== 打包预览对话框 =====
+    if (showPackPreview && packPlans.isNotEmpty()) {
+        PackPreviewDialog(
+            plans = packPlans,
+            onDismiss = { showPackPreview = false; packPlans = emptyList() },
+            onConfirm = { confirmed, rebuildNow ->
+                showPackPreview = false
+                packPlans = emptyList()
+                val dirUri = outputDirUri
+                val groupByTypeNow = groupByType
+                val sub = ConvertMode.WWISE_PACK_FOLDER.subDirName
+                scope.launch {
+                    isProcessing = true
+                    processingStatus = L.s(R.string.x_packing)
+                    try {
+                        val results = executePackPlans(context, confirmed, dirUri, groupByTypeNow, sub, rebuildNow)
+                        batchRecords = results
+                        val ok = results.count { it.second }
+                        val bad = results.size - ok
+                        resultMessage = if (bad == 0)
+                            L.s(R.string.x_ok_prefix) + ok + L.s(R.string.x_files_suffix)
+                        else
+                            L.s(R.string.x_warn_ok_prefix) + ok + L.s(R.string.x_warn_mid) + bad +
+                                L.s(R.string.x_files_suffix) +
+                                (results.firstOrNull { !it.second }?.third?.let { "：" + it } ?: "")
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        resultMessage = e.message ?: e.javaClass.simpleName
+                    } finally { isProcessing = false }
+                }
             }
         )
     }
@@ -802,14 +1385,36 @@ fun MainScreen() {
                     )
                 }
 
+                // ===== 3D 模型（SCG -> OBJ，含 LOD 筛选） =====
+                SectionCard(title = L.s(R.string.sec_3d)) {
+                    FunctionButton(
+                        text = L.s(R.string.b_scg_obj),
+                        icon = Icons.Default.ViewInAr,
+                        onClick = { launchPicker(ConvertMode.SCG_TO_OBJ) },
+                        enabled = !isProcessing
+                    )
+                }
+
+                // ===== WebP 通用转换（图像/视频混批，标准格式、体积小） =====
+                SectionCard(title = L.s(R.string.sec_webp)) {
+                    FunctionButton(
+                        text = L.s(R.string.b_to_webp),
+                        icon = Icons.Default.Collections,
+                        onClick = { launchPicker(ConvertMode.TO_WEBP) },
+                        enabled = !isProcessing
+                    )
+                }
+
                 // ===== Wwise 音频（语音/音效） =====
                 SectionCard(title = L.s(R.string.sec_wwise)) {
+                    // ── 工具 ──
                     Text(
-                        text = L.s(R.string.t_unpack_help) +
-                            L.s(R.string.t_pack_help) +
-                            L.s(R.string.t_bnk_pck_help) +
-                            L.s(R.string.t_toogg_help) +
-                            L.s(R.string.t_towem_help),
+                        text = L.s(R.string.sec_wwise_tools),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = L.s(R.string.t_wwise_tools_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -817,12 +1422,6 @@ fun MainScreen() {
                         text = L.s(R.string.b_ww_unpack),
                         icon = Icons.Default.GraphicEq,
                         onClick = { launchPicker(ConvertMode.WWISE_UNPACK) },
-                        enabled = !isProcessing
-                    )
-                    FunctionButton(
-                        text = L.s(R.string.b_ww_pack),
-                        icon = Icons.Default.LibraryMusic,
-                        onClick = { launchPicker(ConvertMode.WWISE_PACK) },
                         enabled = !isProcessing
                     )
                     FunctionButton(
@@ -841,6 +1440,36 @@ fun MainScreen() {
                         text = L.s(R.string.b_wem_play),
                         icon = Icons.Default.PlayCircle,
                         onClick = { launchPicker(ConvertMode.WWISE_PLAY) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = L.s(R.string.b_ww_pack),
+                        icon = Icons.Default.LibraryMusic,
+                        onClick = { launchPicker(ConvertMode.WWISE_PACK) },
+                        enabled = !isProcessing
+                    )
+                    // ── 制作语音 Mod ──
+                    Text(
+                        text = L.s(R.string.sec_wwise_mod),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    Text(
+                        text = L.s(R.string.t_wwise_mod_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FunctionButton(
+                        text = L.s(R.string.b_ww_template),
+                        icon = Icons.Default.Description,
+                        onClick = { launchPicker(ConvertMode.WWISE_TEMPLATE) },
+                        enabled = !isProcessing
+                    )
+                    FunctionButton(
+                        text = L.s(R.string.b_ww_pack_folder),
+                        icon = Icons.Default.FolderOpen,
+                        onClick = { launchPicker(ConvertMode.WWISE_PACK_FOLDER) },
                         enabled = !isProcessing
                     )
                 }
@@ -1008,6 +1637,238 @@ fun MainScreen() {
     }  // key(currentLang)
 }
 
+/** 解析结果：文件名 + 全部组（已命名、已分级 LOD），供部件选择对话框使用 */
+class ScgParsed(
+    val fileName: String,
+    val scgUri: Uri,
+    val namesFound: Boolean,
+    val groups: List<ScgConverter.ScgGroup>
+)
+
+/** 配件分类（按名字+顶点数）：0车体 1炮塔 2火炮 3行走机构 4皮肤/贴花 5装饰 6其他 7挂点标记 */
+private fun scgCategory(g: ScgConverter.ScgGroup): Int {
+    val n = (g.name ?: "").lowercase()
+    return when {
+        g.vertexCount <= 3 -> 7                       // 3 顶点小三角 = 挂点标记
+        n.contains("turret") -> 1
+        n.contains("gun") -> 2
+        n.contains("hull") -> 0
+        n.contains("chassis") || n.contains("track") || n.contains("side_") ||
+            n.contains("wheel") || n.contains("exhaus") -> 3
+        n.contains("skin") || n.contains("decal") -> 4
+        n.contains("ny") || n.contains("hw") || n.contains("pumpkin") ||
+            n.contains("ladder") || n.contains("cinema") -> 5
+        else -> 6
+    }
+}
+
+private fun scgCategoryLabel(cat: Int): Int = when (cat) {
+    0 -> R.string.scg_cat_hull
+    1 -> R.string.scg_cat_turret
+    2 -> R.string.scg_cat_gun
+    3 -> R.string.scg_cat_chassis
+    4 -> R.string.scg_cat_skin
+    5 -> R.string.scg_cat_decor
+    7 -> R.string.scg_cat_marker
+    else -> R.string.scg_cat_other
+}
+
+/** LOD 预设 -> 默认勾选集合：1=仅LOD0 2=LOD0-1 0=全部；3 顶点挂点标记一律默认不选 */
+private fun scgDefaultSelection(groups: List<ScgConverter.ScgGroup>, lodMode: Int): Set<Long> {
+    val maxLod = when (lodMode) { 1 -> 0; 2 -> 1; else -> Int.MAX_VALUE }
+    return groups.filter { it.vertexCount > 3 && it.lod <= maxLod }.map { it.id }.toSet()
+}
+
+/**
+ * SCG -> OBJ 第一步：读入并解析模型，绑定配件名（用户选中的 .sc2 优先，其次同目录同名 .sc2(.dvpl)），
+ * 完成 LOD 分级。失败抛出带本地化信息的异常。
+ */
+suspend fun parseScgForDialog(context: Context, scgUri: Uri, sc2Uri: Uri?, fileName: String,
+                             extraScgs: List<Pair<String, Uri>> = emptyList()): ScgParsed =
+        withContext(Dispatchers.IO) {
+    val raw = context.contentResolver.openInputStream(scgUri)?.use { it.readBytes() }
+        ?: throw IllegalStateException(L.s(R.string.e_cant_read))
+    // DVPL 容器则先解包
+    val scgData = try { ScgConverter.unwrapDvpl(raw) } catch (e: Exception) {
+        throw IllegalArgumentException(L.s(R.string.e_scg_parse))
+    }
+    val groups = try { ScgConverter.parseScg(scgData).toMutableList() } catch (e: Exception) {
+        throw IllegalArgumentException(L.s(R.string.e_scg_parse))
+    }
+    if (groups.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_scg_parse))
+
+    // 配件名（材质名）：显式选择的 sc2 优先，否则自动找同级
+    var namesFound = false
+    val sc2Bytes = sc2Uri?.let { u ->
+        context.contentResolver.openInputStream(u)?.use { it.readBytes() }
+    } ?: findSiblingSc2(context, scgUri, fileName)?.let { u ->
+        context.contentResolver.openInputStream(u)?.use { it.readBytes() }
+    }
+    if (sc2Bytes != null) {
+        try {
+            val sc2Data = ScgConverter.unwrapDvpl(sc2Bytes)
+            val names = ScgConverter.parseSc2Names(sc2Data, groups.map { it.id }.toSet())
+            for (g in groups) g.sc2Name = names[g.id]
+            namesFound = names.isNotEmpty()
+        } catch (e: Exception) { /* 名字缺失不致命，退回 #ID */ }
+    }
+
+    // LOD 分级（同包围盒按顶点数降序）+ 统一命名（几何分类 > 皮肤/装饰名 > 白名单名）
+    // 官方参数（从已安装游戏读取的零件碰撞盒）用于真名强化，缺失时几何命名兜底
+    val tankParams = try { TankParams.forTank(context, fileName) } catch (e: Exception) { null }
+    ScgConverter.assignLod(groups)
+    try { ScgConverter.assignNames(groups, tankParams) } catch (e: Exception) {
+        // 官方参数命名异常时不阻断导出, 保留已完成的部分命名
+        android.util.Log.w("TankParams", "assignNames failed: " + e.message)
+    }
+
+    // 传奇涂装 3D 外挂件：扫同级目录里本车的 Skin* 件（实测与本体同一世界坐标系），直接拼接
+    // 放在 assignLod 之后：皮肤件不参与 LOD 聚类（避免同 bbox 的多件被当成 LOD 而漏选）
+    var skinMerged = 0
+    try {
+        val key = fileName.removeSuffix(".dvpl").removeSuffix(".scg")
+            .lowercase().replace(Regex("[^a-z0-9]"), "")
+        if (key.length >= 3) {
+            val skins = listSiblingFiles(context, scgUri) { n -> isTankSkinFile(n, key) }
+            var idOff = 1_000_000L
+            for ((skinName, skinUri) in skins) {
+                val raw = context.contentResolver.openInputStream(skinUri)?.use { it.readBytes() } ?: continue
+                val sg = try { ScgConverter.parseScg(ScgConverter.unwrapDvpl(raw)) } catch (e: Exception) { continue }
+                if (sg.isEmpty()) continue
+                val tag = skinName.removeSuffix(".dvpl").removeSuffix(".scg")
+                var piece = 0
+                for (g in sg) {
+                    g.id = idOff++
+                    g.lod = 0
+                    g.name = tag + (if (sg.size > 1) "_#" + ++piece else "")
+                }
+                groups.addAll(sg)
+                skinMerged += sg.size
+            }
+        }
+    } catch (e: Exception) {
+        android.util.Log.w("ScgConvert", "skin merge skipped: " + e.message)
+    }
+
+    // 手动选择的附加件（多选进来的涂装 3D 件 / 其他 scg）: 同世界坐标系直接拼接
+    var idOff = 2_000_000L
+    for ((exName, exUri) in extraScgs) {
+        val raw = try { context.contentResolver.openInputStream(exUri)?.use { it.readBytes() } } catch (e: Exception) { null } ?: continue
+        val sg = try { ScgConverter.parseScg(ScgConverter.unwrapDvpl(raw)) } catch (e: Exception) { continue }
+        if (sg.isEmpty()) continue
+        val tag = exName.removeSuffix(".dvpl").removeSuffix(".scg")
+        var piece = 0
+        for (g in sg) {
+            g.id = idOff++
+            g.lod = 0
+            g.name = tag + (if (sg.size > 1) "_#" + ++piece else "")
+        }
+        groups.addAll(sg)
+        skinMerged += sg.size
+    }
+    if (skinMerged > 0) android.util.Log.i("ScgConvert", "merged " + skinMerged + " extra groups")
+    ScgParsed(fileName, scgUri, namesFound, groups)
+}
+
+/** SCG -> OBJ 第二步：按用户勾选导出 OBJ */
+suspend fun processScg(
+    context: Context,
+    parsed: ScgParsed,
+    selectedIds: Set<Long>,
+    dirUri: Uri?,
+    groupByType: Boolean
+): String = withContext(Dispatchers.IO) {
+    if (selectedIds.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_scg_none))
+    val result = ScgConverter.writeObj(parsed.groups, selectedIds)
+    val outputName = parsed.fileName.removeSuffix(".dvpl").removeSuffix(".scg") + ".obj"
+    val objBytes = result.objText.toByteArray(Charsets.UTF_8)
+    val subDir = if (groupByType) ConvertMode.SCG_TO_OBJ.subDirName else null
+    val savedPath = if (dirUri != null) {
+        saveToDir(context, dirUri, outputName, objBytes, subDir)
+    } else {
+        saveToDownloads(context, outputName, objBytes, subDir)
+    }
+    android.util.Log.i("ScgConvert", "OK: " + parsed.fileName + " -> " + savedPath +
+        " (" + result.keptGroups + "/" + result.totalGroups + " groups, " + result.keptVertices + " verts)")
+    L.s(R.string.x_scg_done, outputName, result.keptGroups, result.totalGroups)
+}
+
+/** 在 SAF 文档的同级目录里找同名 .sc2(.dvpl)；不支持列举的提供方返回 null */
+private fun findSiblingSc2(context: Context, uri: Uri, scgName: String): Uri? {
+    return try {
+        val docId = android.provider.DocumentsContract.getDocumentId(uri)
+        val parent = docId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return null
+        val base = scgName.removeSuffix(".dvpl").removeSuffix(".scg")
+        val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(uri, parent)
+        context.contentResolver.query(
+            childrenUri,
+            arrayOf(
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            ), null, null, null
+        )?.use { c ->
+            val idIdx = c.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = c.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            var found: Uri? = null
+            while (c.moveToNext() && found == null) {
+                val n = c.getString(nameIdx) ?: continue
+                if (n == base + ".sc2" || n == base + ".sc2.dvpl") {
+                    found = android.provider.DocumentsContract.buildDocumentUri(uri.authority, c.getString(idIdx))
+                }
+            }
+            found
+        }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+/**
+ * 判断 SAF 同级目录里的文件是否为本车的涂装 3D 外挂件
+ * 命名规律: Skin2_R88_Object_268_hull / Skin_PzVI_tiger_I_skin2_turret_01 / mskin_T22SR_hull
+ * 规则: 去掉皮肤前缀后, 必须包含本车名(去符号), 且其后紧跟部件词(hull/turret/gun/mask/style)
+ */
+private fun isTankSkinFile(fileName: String, tankKeyNorm: String): Boolean {
+    val n = fileName.lowercase().replace(Regex("[^a-z0-9]"), "")
+    if (!n.endsWith("scg")) return false               // 只收模型文件
+    val mSkin = Regex("^mskin").find(n) ?: Regex("^skin[0-9]*").find(n) ?: return false
+    val rest = n.substring(mSkin.value.length)
+    val ki = rest.indexOf(tankKeyNorm)
+    if (ki < 0) return false
+    var tail = rest.substring(ki + tankKeyNorm.length)
+    tail = Regex("^skin[0-9]*").replace(tail, "")      // 内嵌 skin2/skin3 代数标记
+    if (tail.startsWith("style")) tail = tail.removePrefix("style")
+    return tail.startsWith("hull") || tail.startsWith("turret") ||
+        tail.startsWith("gun") || tail.startsWith("mask")
+}
+
+/** 列出 SAF 同级目录里满足条件的文件（供涂装 3D 件扫描） */
+private fun listSiblingFiles(context: Context, uri: Uri, filter: (String) -> Boolean): List<Pair<String, Uri>> {
+    val out = ArrayList<Pair<String, Uri>>()
+    try {
+        val docId = android.provider.DocumentsContract.getDocumentId(uri)
+        val parent = docId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return out
+        val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(uri, parent)
+        context.contentResolver.query(
+            childrenUri,
+            arrayOf(
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            ), null, null, null
+        )?.use { c ->
+            val idIdx = c.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = c.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            while (c.moveToNext()) {
+                val nm = c.getString(nameIdx) ?: continue
+                if (filter(nm)) out.add(nm to android.provider.DocumentsContract.buildDocumentUri(uri.authority, c.getString(idIdx)))
+            }
+        }
+    } catch (e: Exception) { /* 提供方不支持列举则跳过 */ }
+    return out
+}
+
 /**
  * Wwise 解包/打包批量处理（与纹理管线独立：解包多文件并行，打包按库逐个重建）
  */
@@ -1035,7 +1896,8 @@ suspend fun processWwiseBatch(
                 // events 合并：id 同时出现在多个 json 时拼接去重
                 (info.events.keys + parsed.events.keys).associateWith { id ->
                     ((info.events[id] ?: emptyList()) + (parsed.events[id] ?: emptyList())).distinct()
-                }
+                },
+                info.eventNames + parsed.eventNames
             )
         } catch (e: Exception) {
             android.util.Log.w("Wwise", L.s(R.string.e_sbi_parse) + js.name, e)
@@ -1163,6 +2025,13 @@ suspend fun processWwiseBatch(
                                 if (dirUri != null) saveToDir(context, dirUri, outName, wemBytes, subDir)
                                 else saveToDownloads(context, outName, wemBytes, subDir)
                                 listOf(Triple(sel.name, true, L.s(R.string.x_pcm_wav)))
+                            } else if (WwiseConverter.isWwiseNewPcmWem(wemBytes)) {
+                                // Wwise 2021+ 新版 PCM（codec 0xFFFE）：重建标准 WAV
+                                val wavBytes = WwiseConverter.wemNewPcmToWav(wemBytes)
+                                val outName = makeUniqueSafeName(baseName, "wav")
+                                if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                else saveToDownloads(context, outName, wavBytes, subDir)
+                                listOf(Triple(sel.name, true, L.s(R.string.x_pcm_wav)))
                             } else if (WwiseConverter.isPtAdpcmWem(wemBytes)) {
                                 val wavBytes = WwiseConverter.decodePtAdpcmToWav(wemBytes)
                                 val outName = makeUniqueSafeName(baseName, "wav")
@@ -1222,6 +2091,13 @@ suspend fun processWwiseBatch(
                                         val outName = makeUniqueSafeName(baseName, "wav")
                                         if (dirUri != null) saveToDir(context, dirUri, outName, wem, subDir)
                                         else saveToDownloads(context, outName, wem, subDir)
+                                        wavN++
+                                    } else if (WwiseConverter.isWwiseNewPcmWem(wem)) {
+                                        // Wwise 2021+ 新版 PCM（codec 0xFFFE）：重建标准 WAV
+                                        val wavBytes = WwiseConverter.wemNewPcmToWav(wem)
+                                        val outName = makeUniqueSafeName(baseName, "wav")
+                                        if (dirUri != null) saveToDir(context, dirUri, outName, wavBytes, subDir)
+                                        else saveToDownloads(context, outName, wavBytes, subDir)
                                         wavN++
                                     } else if (WwiseConverter.isPtAdpcmWem(wem)) {
                                         val wavBytes = WwiseConverter.decodePtAdpcmToWav(wem)
@@ -1289,8 +2165,6 @@ suspend fun processWwiseBatch(
                     var fName = sel.name
                     try {
                         currentCoroutineContext().ensureActive()
-                        val inputBytes = context.contentResolver.openInputStream(sel.uri)?.use { it.readBytes() }
-                            ?: throw IllegalStateException(L.s(R.string.e_cant_read))
 
                         // 统一解码为 PCM 再用内置 aoTuV b6.03 编码为 OGG：
                         // 外部 OGG（ffmpeg/标准 libvorbis）的码书与 Wwise 库不一致，必须重编码
@@ -1432,13 +2306,13 @@ suspend fun processWwiseBatch(
 }
 
 /** MediaExtractor 解码结果：16-bit LE interleaved PCM */
-private data class PcmResult(val pcm: ByteArray, val sampleRate: Int, val channels: Int)
+internal data class PcmResult(val pcm: ByteArray, val sampleRate: Int, val channels: Int)
 
 /**
  * 用 Android MediaExtractor + MediaCodec 把任意音频 Uri 解码为 16-bit LE PCM。
  * 支持 WAV/MP3/M4A/AAC/FLAC/OPUS 等所有系统解码器支持的格式。
  */
-private fun decodeToPcm(context: android.content.Context, uri: android.net.Uri): PcmResult {
+internal fun decodeToPcm(context: android.content.Context, uri: android.net.Uri): PcmResult {
     val extractor = android.media.MediaExtractor()
     extractor.setDataSource(context, uri, null)
 
@@ -1474,12 +2348,18 @@ private fun decodeToPcm(context: android.content.Context, uri: android.net.Uri):
     var inputDone = false
     var outputDone = false
     var outputFormat: android.media.MediaFormat? = null
+    // 卡死防护：损坏/不支持的文件可能永不产生 END_OF_STREAM。
+    // 每轮记录是否有进展（入队或出队成功），连续 1000 轮（约 10 秒）
+    // 无进展即判定解码器停摆，抛错释放线程
+    var idleSpins = 0
 
     try {
         while (!outputDone) {
+            var progressed = false
             if (!inputDone) {
                 val inIdx = codec.dequeueInputBuffer(timeoutUs)
                 if (inIdx >= 0) {
+                    progressed = true
                     val buf = codec.getInputBuffer(inIdx)!!
                     val sz = extractor.readSampleData(buf, 0)
                     if (sz < 0) {
@@ -1495,8 +2375,10 @@ private fun decodeToPcm(context: android.content.Context, uri: android.net.Uri):
             val info = android.media.MediaCodec.BufferInfo()
             val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
             if (outIdx == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                progressed = true
                 outputFormat = codec.outputFormat
             } else if (outIdx >= 0) {
+                progressed = true
                 if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
                     outputDone = true
                 val buf = codec.getOutputBuffer(outIdx)!!
@@ -1505,6 +2387,9 @@ private fun decodeToPcm(context: android.content.Context, uri: android.net.Uri):
                 out.write(bytes)
                 codec.releaseOutputBuffer(outIdx, false)
             }
+            if (!progressed && ++idleSpins > 1000)
+                throw IllegalStateException(L.s(R.string.e_decode_timeout))
+            if (progressed) idleSpins = 0
         }
     } finally {
         codec.stop()
@@ -1550,6 +2435,19 @@ private fun makeUniqueSafeName(baseName: String, ext: String): String {
  * 剥离输入的 .dvpl 包裹、旧格式标签（.astc/.dx11，大小写不敏感）、旧扩展名后拼上目标标签
  * 例：xxx.dx11.dds.dvpl + ".astc.pvr" → xxx.astc.pvr
  */
+/** 文件是否为视频（mime video 前缀优先；SAF 常给 octet-stream，扩展名兜底） */
+private fun isVideoFile(context: Context, uri: Uri, fileName: String): Boolean {
+    val mime = try { context.contentResolver.getType(uri) } catch (e: Exception) { null }
+    if (mime != null) {
+        if (mime.startsWith("video/")) return true
+        if (mime.startsWith("image/")) return false
+    }
+    val n = fileName.lowercase()
+    return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv") ||
+        n.endsWith(".3gp") || n.endsWith(".3g2") || n.endsWith(".webm") ||
+        n.endsWith(".avi") || n.endsWith(".m4v") || n.endsWith(".ts") || n.endsWith(".mts")
+}
+
 private fun retagFileName(fileName: String, tagExt: String): String {
     var name = fileName
     if (name.endsWith(".dvpl", ignoreCase = true)) name = name.dropLast(5)  // 剥 dvpl 包裹
@@ -1574,7 +2472,7 @@ private fun String.removeExt(ext: String): String {
 /**
  * 查询 SAF Uri 的文件名
  */
-private fun queryFileName(context: Context, uri: Uri): String {
+internal fun queryFileName(context: Context, uri: Uri): String {
     var name: String? = null
     if (uri.scheme == "content") {
         try {
@@ -1609,12 +2507,25 @@ private fun makeUniqueFileName(dir: DocumentFile, baseName: String): String {
         candidate = base + " (" + i + ")" + ext
         i++
     }
+    // 上限耗尽仍冲突：加时间戳兜底，绝不静默返回已存在的名称
+    if (existing.contains(candidate))
+        candidate = base + " (" + System.currentTimeMillis() + ")" + ext
     return candidate
 }
 
 /**
  * 保存到自定义 SAF 目录
  */
+@Synchronized
+/** 输出 MIME: 正确的 mime 才能被相册/看图软件关联解码（octet-stream 会被当未知文件打不开） */
+private fun mimeForFileName(name: String): String = when {
+    name.endsWith(".webp", ignoreCase = true) -> "image/webp"
+    name.endsWith(".png", ignoreCase = true) -> "image/png"
+    name.endsWith(".jpg", ignoreCase = true) || name.endsWith(".jpeg", ignoreCase = true) -> "image/jpeg"
+    name.endsWith(".mp4", ignoreCase = true) -> "video/mp4"
+    else -> "application/octet-stream"
+}
+
 internal fun saveToDir(
     context: Context,
     dirUri: Uri,
@@ -1635,7 +2546,7 @@ internal fun saveToDir(
         }
     }
     val uniqueName = makeUniqueFileName(dir, fileName)
-    val file = dir.createFile("application/octet-stream", uniqueName)
+    val file = dir.createFile(mimeForFileName(uniqueName), uniqueName)
         ?: throw IllegalStateException(L.s(R.string.e_create_file))
     context.contentResolver.openOutputStream(file.uri)?.use { it.write(data) }
         ?: throw IllegalStateException(L.s(R.string.e_write_file))
@@ -1667,6 +2578,9 @@ private fun makeUniqueMediaName(context: Context, fileName: String, subDir: Stri
             candidate = base + " (" + i + ")" + ext
             i++
         }
+        // 上限耗尽仍冲突：加时间戳兜底，绝不静默返回已存在的名称
+        if (existing.contains(candidate))
+            candidate = base + " (" + System.currentTimeMillis() + ")" + ext
         return candidate
     } catch (e: Exception) {
         return fileName
@@ -1688,7 +2602,7 @@ internal fun saveToDownloads(
         val uniqueName = makeUniqueMediaName(context, fileName, subDir)
         val values = android.content.ContentValues().apply {
             put(android.provider.MediaStore.Downloads.DISPLAY_NAME, uniqueName)
-            put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+            put(android.provider.MediaStore.Downloads.MIME_TYPE, mimeForFileName(uniqueName))
             put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
                 android.os.Environment.DIRECTORY_DOWNLOADS + "/DVPLModHelper" + (subDir?.let { "/" + it } ?: ""))
             put(android.provider.MediaStore.Downloads.IS_PENDING, 1)

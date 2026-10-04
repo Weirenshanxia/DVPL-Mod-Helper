@@ -121,7 +121,8 @@ fun PbrEditorScreen(
                 } else if (DdsConverter.isDdsFile(data)) {
                     bmp = DdsConverter.decodeToBitmap(data)?.first
                 } else if (data.size >= 8 && data[0] == 0x89.toByte() && data[1] == 0x50.toByte()) {
-                    bmp = BitmapFactory.decodeByteArray(data, 0, data.size)
+                    bmp = BitmapFactory.decodeByteArray(data, 0, data.size,
+                        BitmapFactory.Options().apply { inPremultiplied = false })
                 }
                 if (bmp == null) throw IllegalArgumentException(L.s(R.string.e_pbr_formats))
                 // 降采样预览（≤1024）
@@ -162,7 +163,11 @@ fun PbrEditorScreen(
                 extract = if (extractCh.isNotEmpty()) extractCh[0] else null
             )
         }
-        Bitmap.createBitmap(out, src.width, src.height, Bitmap.Config.ARGB_8888)
+        // 直通 alpha 位图: 预览/导出与源数据一致, 半透明不被预乘压暗
+        val b = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        b.isPremultiplied = false
+        b.setPixels(out, 0, src.width, 0, 0, src.width, src.height)
+        b
     }
 
     Scaffold(
@@ -381,7 +386,8 @@ private fun exportFullRes(
     if (PvrConverter.isPvrFile(data)) bmp = PvrConverter.decodeToBitmap(data)
     else if (DdsConverter.isDdsFile(data)) bmp = DdsConverter.decodeToBitmap(data)?.first
     else if (data.size >= 8 && data[0] == 0x89.toByte() && data[1] == 0x50.toByte())
-        bmp = BitmapFactory.decodeByteArray(data, 0, data.size)
+        bmp = BitmapFactory.decodeByteArray(data, 0, data.size,
+            BitmapFactory.Options().apply { inPremultiplied = false })
     if (bmp == null) throw IllegalArgumentException(L.s(R.string.e_redecode))
 
     try {
@@ -394,7 +400,10 @@ private fun exportFullRes(
             PbrOp.NORMAL -> PbrOps.generateNormal(px, w, h, strength, invertBump)
             PbrOp.CHANNEL -> PbrOps.channelOps(px, swap, invertSet, extract)
         }
-        val outBmp = Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+        // 直通 alpha 位图: 编码进 DDS/PVR 的通道值与运算结果一致
+        val outBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        outBmp.isPremultiplied = false
+        outBmp.setPixels(out, 0, w, 0, 0, w, h)
         try {
             val encoded = if (fmt.isDds) DdsConverter.encodeToDds(outBmp, fmt.toDdsFormat(), linear)
             else PvrConverter.encodeToPvr(outBmp, fmt.toAstcQuality(), linear)

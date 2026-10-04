@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Android 11+ 包可见性：需要声明才能读到已安装游戏的 assets（官方参数命名用） -->
+    <queries>
+        <package android:name="com.netease.wotb" />
+        <package android:name="com.wargaming.wotblitz" />
+        <package android:name="com.wargaming.wotblitz.eu" />
+        <package android:name="com.wargaming.wotblitz.na" />
+        <package android:name="com.wargaming.wotblitz.asia" />
+        <package android:name="" />
+    </queries>
+
     <!-- 使用 SAF 文件选择器，无需任何存储权限 -->
 
     <application

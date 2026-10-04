@@ -15,14 +15,20 @@ import java.util.Locale
  * 都可用 L.s(resId) 取当前语言文案。语言切换通过 Activity recreate() 生效。
  */
 object AppCtx {
-    lateinit var app: Context
+    // 在 Application/attachBaseContext 之前被访问时报错可读，
+    // 而非 UninitializedPropertyAccessException
+    private var _app: Context? = null
+    var app: Context
+        get() = _app ?: error("AppCtx 未初始化：请确保 L.wrap() 在 attachBaseContext 中先行调用")
+        set(value) { _app = value }
 }
 
 object L {
     /** 当前语言：system / zh / en / ru */
     const val KEY_LANG = "app_language"
 
-    private var ctx: Context? = null
+    // 主线程（applyLanguage/wrap）写、IO 协程（L.s）读，必须保证可见性
+    @Volatile private var ctx: Context? = null
 
     fun s(@StringRes id: Int): String = (ctx ?: AppCtx.app).getString(id)
 
@@ -30,14 +36,16 @@ object L {
 
     // ===== 语言管理 =====
 
-    fun getLanguage(): String =
+    // SharedPreferences 单实例（懒加载），避免每次调用重新创建
+    private val prefs by lazy {
         AppCtx.app.getSharedPreferences("dvpl_prefs", Context.MODE_PRIVATE)
-            .getString(KEY_LANG, "system") ?: "system"
+    }
+
+    fun getLanguage(): String = prefs.getString(KEY_LANG, "system") ?: "system"
 
     /** 应用内即时切换：只更新内存 + prefs，由 Compose 重组生效（无 Activity 重建、无黑屏） */
     fun applyLanguage(lang: String) {
-        AppCtx.app.getSharedPreferences("dvpl_prefs", Context.MODE_PRIVATE)
-            .edit().putString(KEY_LANG, lang).apply()
+        prefs.edit().putString(KEY_LANG, lang).apply()
         if (lang == "system") {
             ctx = null
             val sys = AppCtx.app.resources.configuration.locales[0]

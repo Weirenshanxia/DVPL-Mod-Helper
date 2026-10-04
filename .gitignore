@@ -32,3 +32,4 @@ captures/
 # NDK
 obj/
 libs/
+.vscode/c_cpp_properties.json

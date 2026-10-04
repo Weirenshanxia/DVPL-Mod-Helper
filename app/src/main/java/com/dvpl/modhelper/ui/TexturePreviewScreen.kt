@@ -78,7 +78,7 @@ fun TexturePreviewScreen(
                             w = maxOf(1, (w + 1) / 2); h = maxOf(1, (h + 1) / 2)
                         }
                         source = TextureSource.AstcCompressed(
-                            info.width, info.height, info.blockW, info.blockH, false, mips)
+                            info.width, info.height, info.blockW, info.blockH, false, mips, false) // NM 为线性编码, 不用 sRGB 采样
                         val csLabel = PvrConverter.getColorSpaceLabel(data)
                         infoText = "PVR ASTC ${info.blockW}x${info.blockH}  ${info.width}x${info.height}  ${info.mips} mips" +
                             (if (csLabel.isNotEmpty()) "  $csLabel" else "")
@@ -94,7 +94,7 @@ fun TexturePreviewScreen(
                         return@withContext
                     }
                 } else if (DdsConverter.isDdsFile(data)) {
-                    val (bmp, format) = DdsConverter.decodeToBitmap(data)
+                    val (bmp, format) = DdsConverter.decodeToBitmap(data, fileName)
                         ?: throw IllegalArgumentException(L.s(R.string.e_dds_fmt))
                     source = TextureSource.DecodedBitmaps(listOf(bmp))
                     val ddsCs = DdsConverter.getColorSpaceLabel(data)
@@ -123,9 +123,13 @@ fun TexturePreviewScreen(
                         scope.launch {
                             val message = withContext(Dispatchers.IO) {
                                 try {
-                                    val bmp = exportBitmap ?: fileBytes?.let {
+                                    val bmp0 = exportBitmap ?: fileBytes?.let {
                                         if (PvrConverter.isPvrFile(it)) PvrConverter.decodeToBitmap(it) else null
                                     }
+                                    // NM: pbr 灰度版(RGB=X,A=Y) → 标准法线色；彩色版存储值即标准值
+                                    val bmp = if (bmp0 != null && PvrConverter.isNormalMapName(fileName) &&
+                                        PvrConverter.isPbrGrayNormalMap(bmp0))
+                                        PvrConverter.fromPbrGrayNormalMap(bmp0) else bmp0
                                     if (bmp != null) {
                                         val out = ByteArrayOutputStream()
                                         bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
@@ -227,7 +231,11 @@ fun TexturePreviewScreen(
                         )
                         // P3 优化：生命周期转发（组合销毁时暂停 GL 线程）
                         DisposableEffect(Unit) {
-                            onDispose { glViewRef?.onPause() }
+                            onDispose {
+                                // 先在 GL 线程释放 GPU 对象，再停 GL 线程（防显存泄漏）
+                                glViewRef?.queueEvent { rendererRef?.release() }
+                                glViewRef?.onPause()
+                            }
                         }
                     }
                     // 信息栏 + mip 切换

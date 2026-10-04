@@ -33,6 +33,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     private var program = 0
     private var texId = 0
     private var vao = 0
+    private var vboId = 0
     // P4 优化：uniform location 缓存（不再每帧查询）
     private var uZoomLoc = 0
     private var uPanLoc = 0
@@ -53,6 +54,17 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     private var uploadBuffer: ByteBuffer? = null
 
     fun markDirty() { textureDirty = true }
+
+    /**
+     * 释放全部 GPU 对象（幂等）。必须在 GL 线程调用：
+     * 外层用 glSurfaceView.queueEvent { renderer.release() } 转发。
+     */
+    fun release() {
+        if (texId != 0) { GLES30.glDeleteTextures(1, intArrayOf(texId), 0); texId = 0 }
+        if (vao != 0) { GLES30.glDeleteVertexArrays(1, intArrayOf(vao), 0); vao = 0 }
+        if (vboId != 0) { GLES30.glDeleteBuffers(1, intArrayOf(vboId), 0); vboId = 0 }
+        if (program != 0) { GLES30.glDeleteProgram(program); program = 0 }
+    }
 
     /** 按纹理/视口宽高比计算 contain 适配（zoom=1 完整显示不拉伸） */
     private fun updateNdcSize() {
@@ -101,6 +113,8 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // 防御：surface 在同一 GL 上下文上重建时先释放旧对象，避免显存泄漏
+        release()
         val exts = GLES30.glGetString(GLES30.GL_EXTENSIONS) ?: ""
         val hasLdr = exts.contains("GL_KHR_texture_compression_astc_ldr")
         val hasHdr = exts.contains("GL_KHR_texture_compression_astc_hdr")
@@ -120,6 +134,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         )
         val vbo = IntArray(1)
         GLES30.glGenBuffers(1, vbo, 0)
+        vboId = vbo[0]
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[0])
         val buf = ByteBuffer.allocateDirect(verts.size * 4).order(ByteOrder.nativeOrder())
         buf.asFloatBuffer().put(verts)
@@ -151,7 +166,7 @@ class TextureRenderer(@Volatile var source: TextureSource) : GLSurfaceView.Rende
         when (val src = source) {
             is TextureSource.AstcCompressed -> {
                 val mip = src.mips.getOrElse(currentMip) { src.mips.last() }
-                val format = astcGlFormat(src.blockW, src.blockH)
+                val format = astcGlFormat(src.blockW, src.blockH, src.srgb)
                 // P4 优化：复用 direct buffer
                 val dataBuf = uploadBuffer?.takeIf { it.capacity() >= mip.data.size }
                     ?: ByteBuffer.allocateDirect(mip.data.size).order(ByteOrder.nativeOrder())

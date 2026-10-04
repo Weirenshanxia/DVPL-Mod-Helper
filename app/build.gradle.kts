@@ -127,4 +127,7 @@ dependencies {
     
     // 调试工具
     debugImplementation("androidx.compose.ui:ui-tooling")
+    
+    // JVM 单元测试（复刻 SCG 导出管线复现崩溃用）
+    testImplementation("junit:junit:4.13.2")
 }

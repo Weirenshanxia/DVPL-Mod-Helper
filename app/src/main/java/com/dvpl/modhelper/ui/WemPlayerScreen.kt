@@ -46,26 +46,66 @@ fun WemPlayerScreen(
         mutableStateOf(WwiseConverter.SoundbanksInfo(emptyMap(), emptyMap(), emptyMap()))
     }
     val jsonFiles = files.filter { it.second.contains("soundbanksinfo", ignoreCase = true) }
-    val wemFiles = remember(files) { files.filterNot { it.second.contains("soundbanksinfo", ignoreCase = true) } }
+    // bank 文件（bnk/pck，可带 dvpl 包裹）：解析其 HIRC 事件结构，给 WEM 标注触发事件。
+    // mod 重建包的媒体 ID 在 SoundbanksInfo 里查不到，事件名只能从 bank 自带的 HIRC 拿
+    val bankFiles = remember(files) {
+        files.filter { (_, name) ->
+            val n = name.lowercase()
+            !n.contains("soundbanksinfo") &&
+                (n.endsWith(".bnk") || n.endsWith(".pck") ||
+                    n.endsWith(".bnk.dvpl") || n.endsWith(".pck.dvpl"))
+        }
+    }
+    val wemFiles = remember(files) {
+        files.filterNot { (_, name) ->
+            val n = name.lowercase()
+            n.contains("soundbanksinfo") || n.endsWith(".bnk") || n.endsWith(".pck") ||
+                n.endsWith(".bnk.dvpl") || n.endsWith(".pck.dvpl")
+        }
+    }
+    // bank HIRC 解析出的 mediaId → 事件名列表
+    var hircEvents by remember { mutableStateOf<Map<Long, List<String>>>(emptyMap()) }
     LaunchedEffect(files) {
-        if (jsonFiles.isEmpty()) return@LaunchedEffect
-        info = withContext(Dispatchers.IO) {
+        if (jsonFiles.isEmpty() && bankFiles.isEmpty()) return@LaunchedEffect
+        val result = withContext(Dispatchers.IO) {
             var names = emptyMap<Long, String>()
             var events = emptyMap<Long, List<String>>()
+            var eventNames = emptyMap<Long, String>()
             for ((uri, _) in jsonFiles) {
                 try {
                     val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: continue
                     val data = if (DvplCodec.isDvplFile(raw)) DvplCodec.decode(raw) else raw
                     val parsed = WwiseConverter.parseSoundbanksInfo(data)
                     names += parsed.names
+                    eventNames += parsed.eventNames
                     events = (events.keys + parsed.events.keys).associateWith { id ->
                         ((events[id] ?: emptyList()) + (parsed.events[id] ?: emptyList())).distinct()
                     }
                 } catch (_: Exception) {
                 }
             }
-            WwiseConverter.SoundbanksInfo(names, emptyMap(), events)
+            // bank 自带 HIRC：按事件子树收集媒体（优先用 JSON 事件名，无 JSON 时按 Event 对象分组）
+            val he = HashMap<Long, MutableList<String>>()
+            for ((uri, _) in bankFiles) {
+                try {
+                    val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: continue
+                    val data = if (DvplCodec.isDvplFile(raw)) DvplCodec.decode(raw) else raw
+                    val bank = WwiseConverter.parse(data) ?: continue
+                    val roots: Collection<Long> = if (eventNames.isNotEmpty()) eventNames.keys
+                    else WwiseConverter.hircEventObjectIds(bank)
+                    for ((evId, medias) in WwiseConverter.parseHircGroups(bank, roots)) {
+                        val nm = eventNames[evId] ?: ("ev_" + evId)
+                        for (m in medias) {
+                            he.getOrPut(m) { ArrayList() }.apply { if (!contains(nm)) add(nm) }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            Pair(WwiseConverter.SoundbanksInfo(names, emptyMap(), events, eventNames), he)
         }
+        info = result.first
+        hircEvents = result.second
     }
 
     // 播放状态
@@ -104,6 +144,10 @@ fun WemPlayerScreen(
                     }
                     if (WwiseConverter.isPcmWem(wemBytes)) {
                         File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wemBytes) }
+                    } else if (WwiseConverter.isWwiseNewPcmWem(wemBytes)) {
+                        // Wwise 2021+ 新版 PCM（codec 0xFFFE）：重建标准 WAV
+                        val wavBytes = WwiseConverter.wemNewPcmToWav(wemBytes)
+                        File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wavBytes) }
                     } else if (WwiseConverter.isPtAdpcmWem(wemBytes)) {
                         val wavBytes = WwiseConverter.decodePtAdpcmToWav(wemBytes)
                         File(context.cacheDir, "wemplay_${index}.wav").also { it.writeBytes(wavBytes) }
@@ -169,7 +213,9 @@ fun WemPlayerScreen(
                 )
             } else {
                 Text(
-                    text = L.s(R.string.x_tap_play) + (if (jsonFiles.isNotEmpty()) L.s(R.string.x_events_from_sbi) else L.s(R.string.x_sbi_hint)),
+                    text = L.s(R.string.x_tap_play) +
+                        (if (jsonFiles.isNotEmpty()) L.s(R.string.x_events_from_sbi) else L.s(R.string.x_sbi_hint)) +
+                        (if (bankFiles.isNotEmpty()) L.s(R.string.x_events_from_bank) else ""),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 8.dp)
@@ -218,7 +264,9 @@ fun WemPlayerScreen(
                 itemsIndexed(wemFiles) { index, (uri, name) ->
                     val id = WwiseConverter.parseWemFileName(name).first
                     val origName = id?.let { info.names[it] }
-                    val events = id?.let { info.events[it] }
+                    val events = id?.let { idv ->
+                        ((info.events[idv] ?: emptyList()) + (hircEvents[idv] ?: emptyList())).distinct()
+                    }
                     val isPlaying = playingIndex == index
                     val isConverting = convertingIndex == index
                     Card(

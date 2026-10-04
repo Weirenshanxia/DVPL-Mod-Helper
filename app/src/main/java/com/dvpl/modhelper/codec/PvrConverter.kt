@@ -32,7 +32,9 @@ object PvrConverter {
         ASTC_5x5(5, 5, R.string.astc_5x5),
         ASTC_6x6(6, 6, R.string.astc_6x6),
         ASTC_8x6(8, 6, R.string.astc_8x6),
+        ASTC_8x8(8, 8, R.string.astc_8x8),
         ASTC_10x5(10, 5, R.string.astc_10x5),
+        R8(0, 0, R.string.fmt_r8),
         RGBA_8888(0, 0, R.string.fmt_rgba8888),
         RGBA_4444_PC(0, 0, R.string.fmt_rgba4444)
     }
@@ -71,6 +73,17 @@ object PvrConverter {
         return if (cs == 1) "sRGB" else L.s(R.string.l_linear)
     }
 
+    /** 读取 PVR v3 头色彩空间：true=线性(cs=0)，false=sRGB(cs=1)，null=读不出（PVR→DDS 自动用） */
+    fun isLinearPvr(pvrData: ByteArray): Boolean? {
+        val data = unwrap(pvrData)
+        if (data.size < 20) return null
+        val cs = (data[16].toInt() and 0xFF) or
+            ((data[17].toInt() and 0xFF) shl 8) or
+            ((data[18].toInt() and 0xFF) shl 16) or
+            ((data[19].toInt() and 0xFF) shl 24)
+        return cs == 0
+    }
+
     /**
      * 解码指定 mip → Bitmap
      */
@@ -99,7 +112,90 @@ object PvrConverter {
         if (maxAlpha < 16) {
             for (i in pixels.indices) pixels[i] = pixels[i] or (0xFF shl 24)
         }
-        return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        // 直通 alpha 位图：Android 的 createBitmap(int[]) 会把输入预乘化（R'=R*A/255），
+        // getPixels 返回预乘值 → 转出 DDS/PNG 时半透明区域颜色整体偏深（游戏按直通采样）。
+        // 先标记非预乘再 setPixels，通道值无损透传。
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.isPremultiplied = false
+        bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        return bmp
+    }
+
+    // ===== 法线贴图编码（2026-10 重验修正） =====
+    // 实测手机版(com.netease.wotb) 4 样本（IS-3 1024² / B-1bis 512² / E-100 1024² / G56_E100_track 256²）
+    // 及 PC Steam 彩色 DDS（IS-3 / B-1bis）：NM 存储值一律为标准线性编码 value=(n+1)/2*255，
+    // 平坦像素 = (127~129, 127~129, 254~255, 255)，全样本 R==G==B 仅出现在 pbr 灰度版，无 sRGB 传递函数。
+    // 旧版「平坦=187 sRGB 编码」结论无法在任何现行游戏文件复现（疑似当年误测了 app 自己转出的文件），
+    // 已废除全部 sRGB 伽马转换；转换路径保持恒等，仅按目标格式做通道重排。
+
+    /** 文件名是否为法线贴图（游戏约定：*_NM.astc.pvr.dvpl / *_NM.png / *_NM_2...） */
+    fun isNormalMapName(name: String): Boolean {
+        val n = name.lowercase()
+        return n.contains("_nm.") || n.contains("_nm_") || n.endsWith("_nm")
+    }
+
+    /** images_pbr 目录 NM（手机版）为「灰度 RGB + Alpha」双标量格式：
+     *  RGB 同值 = X 分量、A = Y 分量，均线性标准编码（实测 IS-3_NM / G56_E100_track_NM：
+     *  灰度分布与彩色版 X 逐像素一致、A 分布与彩色版 Y 一致，平坦≈128；旧版误将 A 置 255，
+     *  Y 恒为 +1 → Z=sqrt(1-x²-y²)≈0 → 游戏内整体偏暗的根因）。 */
+    fun toPbrGrayNormalMap(src: Bitmap): Bitmap {
+        val b = if (src.isMutable) src else src.copy(Bitmap.Config.ARGB_8888, true)
+        val w = b.width; val h = b.height
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val p = px[i]
+            val x = (p shr 16) and 0xFF
+            val y = (p shr 8) and 0xFF
+            px[i] = (y shl 24) or (x shl 16) or (x shl 8) or x
+        }
+        b.setPixels(px, 0, w, 0, 0, w, h)
+        return b
+    }
+
+    /** 位图是否为 images_pbr 灰度 NM（RGB 同值 + Alpha 有变化；彩色法线 B 通道平坦区≈255 不会误判） */
+    fun isPbrGrayNormalMap(src: Bitmap): Boolean {
+        val n = src.width * src.height
+        if (n == 0) return false
+        val step = maxOf(1, n / 2048)
+        var gray = 0; var aVar = false; var firstA = -1; var cnt = 0
+        val px = IntArray(minOf(n, maxOf(65536, src.width)))
+        val stride = src.width
+        var row = 0; var off = 0
+        while (off < n) {
+            val rowsLeft = src.height - row
+            val take = minOf(rowsLeft, maxOf(1, (px.size / stride)))
+            src.getPixels(px, 0, stride, 0, row, stride, take)
+            for (i in 0 until take * stride step step) {
+                val p = px[i]
+                val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val bb = p and 0xFF
+                if (r == g && g == bb) gray++
+                val a = p ushr 24
+                if (firstA < 0) firstA = a else if (a != firstA) aVar = true
+                cnt++
+            }
+            row += take; off += take * stride
+        }
+        return cnt > 0 && gray >= cnt * 19 / 20 && aVar
+    }
+
+    /** images_pbr 灰度 NM → 标准法线（X=R, Y=A, Z=sqrt(1-x²-y²) 重建，alpha 置 255） */
+    fun fromPbrGrayNormalMap(src: Bitmap): Bitmap {
+        val b = if (src.isMutable) src else src.copy(Bitmap.Config.ARGB_8888, true)
+        val w = b.width; val h = b.height
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val p = px[i]
+            val fx = ((p shr 16) and 0xFF) / 255.0 * 2 - 1
+            val fy = (p ushr 24) / 255.0 * 2 - 1
+            var fz2 = 1.0 - fx * fx - fy * fy
+            if (fz2 < 0) fz2 = 0.0
+            val zb = Math.round((Math.sqrt(fz2) + 1) * 127.5).toInt().coerceIn(0, 255)
+            px[i] = (0xFF shl 24) or (((p shr 16) and 0xFF) shl 16) or ((p ushr 24) shl 8) or zb
+        }
+        b.setPixels(px, 0, w, 0, 0, w, h)
+        return b
     }
 
     /**
@@ -127,7 +223,8 @@ object PvrConverter {
             mips++
         }
 
-        val isAstc = quality != AstcQuality.RGBA_8888 && quality != AstcQuality.RGBA_4444_PC
+        val isR8 = quality == AstcQuality.R8
+        val isAstc = !isR8 && quality != AstcQuality.RGBA_8888 && quality != AstcQuality.RGBA_4444_PC
         val bw = if (isAstc) quality.blockW else 0
         val bh = if (isAstc) quality.blockH else 0
         val is4444 = quality == AstcQuality.RGBA_4444_PC
@@ -138,6 +235,7 @@ object PvrConverter {
         var ew = w; var eh = h
         repeat(mips) {
             exactTotal += when {
+                isR8 -> ew.toLong() * eh
                 is4444 -> ew.toLong() * eh * 2
                 isAstc -> ((ew + bw - 1) / bw).toLong() * ((eh + bh - 1) / bh) * 16
                 else -> ew.toLong() * eh * 4
@@ -151,8 +249,12 @@ object PvrConverter {
         header.putInt(0x03525650)   // version "PVR\x03"
         header.putInt(0)            // flags
         if (isAstc) {
-            header.putInt(astcBlockToEnum(bw, bh))  // pixelFormat 低32（WoT 非标枚举）
+            header.putInt(astcBlockToEnum(bw, bh))  // pixelFormat 低32 = 官方枚举 27..40
             header.putInt(0)        // 高32 = 0
+        } else if (isR8) {
+            // R8 单通道（CM 迷彩蒙版）：pfLo=97、pfHi=8，938 个游戏 CM 文件逐字节实证
+            header.putInt(97)
+            header.putInt(8)
         } else if (is4444) {
             // PC DX11 PVR：pfLo="rgba"、pfHi=[4,4,4,4]（实测游戏文件确认）
             header.putInt(0x61626772)
@@ -162,8 +264,8 @@ object PvrConverter {
             header.putInt(0x61626772)
             header.putInt(0x01010101)
         }
-        header.putInt(if (isLinear) 0 else 1)  // colorSpace: 0=线性(NM/RM/MISC), 1=sRGB(BC/ALBEDO/CM)
-        header.putInt(if (is4444) 0 else 4)  // channelType（PC 4444 文件实测为 0）
+        header.putInt(if (isR8 || isLinear) 0 else 1)  // colorSpace: 0=线性(R8/NM/RM/MISC), 1=sRGB(BC/ALBEDO)
+        header.putInt(if (isAstc || isR8 || is4444) 0 else 4)  // channelType: ASTC/R8/4444 实测全为 0
         header.putInt(h)            // height
         header.putInt(w)            // width
         header.putInt(1)            // depth
@@ -183,7 +285,7 @@ object PvrConverter {
         var isFirst = true
         repeat(mips) {
             if (isAstc) {
-                val pixels = maxPixels!!
+                val pixels = maxPixels ?: error("ASTC pixel buffer missing")
                 curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
                 val compressed = nativeAstcEncode(pixels, curW, curH, bw, bh, 0)
                     ?: throw IllegalStateException(L.s(R.string.tpl_astc_fail, curW, curH))
@@ -192,7 +294,7 @@ object PvrConverter {
             } else if (is4444) {
                 // RGBA4444（PC DX11 PVR）：ARGB int → [R<<4|G, B<<4|A] 字节对，逐行流式
                 val row = ByteArray(curW * 2)
-                val rows = rowInts!!
+                val rows = rowInts ?: error("4444 row buffer missing")
                 for (y in 0 until curH) {
                     curBitmap.getPixels(rows, 0, curW, 0, y, curW, 1)
                     for (x in 0 until curW) {
@@ -207,10 +309,20 @@ object PvrConverter {
                     crc.update(row)
                     out.write(row)
                 }
+            } else if (isR8) {
+                // R8：红通道蒙版，逐行流式
+                val row = ByteArray(curW)
+                val rows = rowInts ?: error("R8 row buffer missing")
+                for (y in 0 until curH) {
+                    curBitmap.getPixels(rows, 0, curW, 0, y, curW, 1)
+                    for (x in 0 until curW) row[x] = ((rows[x] shr 16) and 0xFF).toByte()
+                    crc.update(row)
+                    out.write(row)
+                }
             } else {
                 // RGBA8888: ARGB int → RGBA 字节，逐行流式
                 val row = ByteArray(curW * 4)
-                val rows = rowInts!!
+                val rows = rowInts ?: error("8888 row buffer missing")
                 for (y in 0 until curH) {
                     curBitmap.getPixels(rows, 0, curW, 0, y, curW, 1)
                     for (x in 0 until curW) {
@@ -278,16 +390,21 @@ object PvrConverter {
     }
 
     private fun astcBlockToEnum(bw: Int, bh: Int): Int = when {
+        // 官方 PVRTexLib 枚举 27..40（与 16000+ 游戏文件逐字节反推一致）
         bw == 4 && bh == 4 -> 27
+        bw == 5 && bh == 4 -> 28
         bw == 5 && bh == 5 -> 29
+        bw == 6 && bh == 5 -> 30
         bw == 6 && bh == 6 -> 31
+        bw == 8 && bh == 5 -> 32
         bw == 8 && bh == 6 -> 33
+        bw == 8 && bh == 8 -> 34
         bw == 10 && bh == 5 -> 35
-        bw == 8 && bh == 8 -> 37
-        bw == 10 && bh == 10 -> 39
-        bw == 12 && bh == 12 -> 41
-        bw == 8 && bh == 5 -> 43
-        bw == 8 && bh == 10 -> 45
-        else -> 31
+        bw == 10 && bh == 6 -> 36
+        bw == 10 && bh == 8 -> 37
+        bw == 10 && bh == 10 -> 38
+        bw == 12 && bh == 10 -> 39
+        bw == 12 && bh == 12 -> 40
+        else -> 27
     }
 }

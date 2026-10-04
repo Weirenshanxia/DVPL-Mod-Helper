@@ -36,12 +36,18 @@ static bool getAstcBlockSize(uint32_t pf, int& bw, int& bh) {
         // 已实测的枚举给精确初始值（refine 仍会校验）
         switch (pf) {
             case 27: bw = 4;  bh = 4;  break;
+            case 28: bw = 5;  bh = 4;  break;
             case 29: bw = 5;  bh = 5;  break;
             case 30: bw = 6;  bh = 5;  break;
             case 31: bw = 6;  bh = 6;  break;
+            case 32: bw = 8;  bh = 5;  break;
             case 33: bw = 8;  bh = 6;  break;
+            case 34: bw = 8;  bh = 8;  break;
             case 35: bw = 10; bh = 5;  break;
+            case 36: bw = 10; bh = 6;  break;
+            case 37: bw = 10; bh = 8;  break;
             case 38: bw = 10; bh = 10; break;
+            case 39: bw = 12; bh = 10; break;
             case 40: bw = 12; bh = 12; break;
             default: bw = 6;  bh = 6;  break; // 未实测枚举：默认猜测，交 refine 修正
         }

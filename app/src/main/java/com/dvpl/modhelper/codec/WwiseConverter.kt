@@ -45,7 +45,13 @@ object WwiseConverter {
         /** DATA 段起始（PCK：绝对；BNK：DATA payload 起始，条目 offset 为相对值） */
         val dataStart: Int,
         /** 原始 bank 字节（重打包时复用） */
-        val original: ByteArray
+        val original: ByteArray,
+        /** PCK 索引表起始偏移（旧版头 0x38 / 新版头 0x34，parsePck 按版本写入；BNK 恒 0） */
+        val pckTableStart: Int = 0x38,
+        /** HIRC 事件区 payload 起始（仅 BNK 有；PCK 恒 -1） */
+        val hircStart: Int = -1,
+        /** HIRC 事件区大小（无则为 0） */
+        val hircSize: Int = 0
     ) {
         fun extract(entry: WemEntry): ByteArray = entry.extractFrom(original, dataStart)
     }
@@ -90,7 +96,7 @@ object WwiseConverter {
         }
         // dataStart 仅用于 repack 定位数据区起点；从第一条 entry 的最小偏移推算
         val dataStart = if (entries.isEmpty()) tableEnd else entries.minOf { it.offset }
-        return Bank(true, entries, dataStart, data)
+        return Bank(true, entries, dataStart, data, tableStart)
     }
 
     // ---------- BNK ----------
@@ -110,9 +116,12 @@ object WwiseConverter {
         if (pos != data.size) return null // 尾部有残缺，拒绝解析
         val didx = sections.firstOrNull { it.magic == "DIDX" }
         val dataSec = sections.firstOrNull { it.magic == "DATA" }
+        val hircSec = sections.firstOrNull { it.magic == "HIRC" }
         if (didx == null || dataSec == null) {
             // 纯事件库（Init/utility_events 等无媒体）：返回空条目表
-            return Bank(false, emptyList(), -1, data)
+            return Bank(false, emptyList(), -1, data,
+                hircStart = hircSec?.payloadStart ?: -1,
+                hircSize = hircSec?.payloadSize ?: 0)
         }
         if (didx.payloadSize % 12 != 0) return null
         val n = didx.payloadSize / 12
@@ -124,7 +133,9 @@ object WwiseConverter {
             val size = readU32(data, o + 8)
             entries.add(WemEntry(id.toLong(), 1L, size, dataSec.payloadStart + off))
         }
-        return Bank(false, entries, dataSec.payloadStart, data)
+        return Bank(false, entries, dataSec.payloadStart, data,
+            hircStart = hircSec?.payloadStart ?: -1,
+            hircSize = hircSec?.payloadSize ?: 0)
     }
 
     // ---------- 重打包 ----------
@@ -166,13 +177,20 @@ object WwiseConverter {
 
     private fun repackPck(bank: Bank, media: List<ByteArray>): ByteArray {
         val count = bank.entries.size
-        val dataStart = 0x38 + 20 * count + 4
+        // 版本感知：索引表起始由 parsePck 按头版本写入（旧版 0x38 / 新版 0x34），
+        // 不再硬编码旧版布局——否则新版 PCK 所有条目 offset 偏移 4 字节
+        val tableStart = bank.pckTableStart
+        val tableEnd = tableStart + 20 * count
+        // 数据区起始沿用原文件：条目数不变 → 头部与索引表布局不变，
+        // 从原条目最小绝对偏移取（含表尾与数据区之间的填充字节）
+        val dataStart = if (count == 0) tableEnd
+            else bank.entries.minOf { it.offset }.coerceAtLeast(tableEnd)
         var total = dataStart.toLong()
         for (m in media) total += m.size
         val out = java.io.ByteArrayOutputStream(total.toInt())
-        // 头 0x00..0x38 原样（含文件数与索引区大小——条目数不变，二者都不变）
-        out.write(bank.original, 0, 0x38)
-        var cum = dataStart // PCK offset 为绝对偏移，从 DATA 起始累计
+        // 头部原样（含文件数与索引区大小——条目数不变，二者都不变）
+        out.write(bank.original, 0, tableStart)
+        var cum = dataStart // PCK offset 为绝对偏移，从数据区起始累计
         val bb = java.nio.ByteBuffer.allocate(20 * count).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         for (i in bank.entries.indices) {
             val e = bank.entries[i]
@@ -184,8 +202,8 @@ object WwiseConverter {
             cum += media[i].size
         }
         out.write(bb.array())
-        val pad = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        out.write(pad.array())
+        // 索引表与数据区之间的原文件字节（如 4 字节填充）原样保留
+        if (dataStart > tableEnd) out.write(bank.original, tableEnd, dataStart - tableEnd)
         for (m in media) out.write(m)
         return out.toByteArray()
     }
@@ -252,7 +270,9 @@ object WwiseConverter {
         /** wemId → 原始目录（ShortName 目录部分，归一化为 a/b 形式；顶层为空串） */
         val dirs: Map<Long, String>,
         /** wemId → 引用该文件的 Wwise 事件名列表（回答「什么时候播放」） */
-        val events: Map<Long, List<String>>
+        val events: Map<Long, List<String>>,
+        /** 事件 id → 事件名（HIRC 兜底分组用：bank 内置事件结构与 JSON 名字对上时命名文件夹） */
+        val eventNames: Map<Long, String> = emptyMap()
     )
 
     private val emptyInfo = SoundbanksInfo(emptyMap(), emptyMap(), emptyMap())
@@ -269,9 +289,10 @@ object WwiseConverter {
             val names = HashMap<Long, String>()
             val dirs = HashMap<Long, String>()
             val events = HashMap<Long, MutableList<String>>()
+            val eventNames = HashMap<Long, String>()
             val root = JSONObject(String(json, Charsets.UTF_8))
-            walkJson(root, names, dirs, events)
-            SoundbanksInfo(names, dirs, events)
+            walkJson(root, names, dirs, events, eventNames)
+            SoundbanksInfo(names, dirs, events, eventNames)
         } catch (e: Exception) {
             emptyInfo
         }
@@ -281,7 +302,8 @@ object WwiseConverter {
         node: Any?,
         names: HashMap<Long, String>,
         dirs: HashMap<Long, String>,
-        events: HashMap<Long, MutableList<String>>
+        events: HashMap<Long, MutableList<String>>,
+        eventNames: HashMap<Long, String>
     ) {
         when (node) {
             is JSONObject -> {
@@ -301,6 +323,11 @@ object WwiseConverter {
                 }
                 // Wwise 事件：Name + 引用文件列表
                 val evName = node.optString("Name")
+                // 记录事件 id → 名字（HIRC 兜底分组时给 bank 内置事件结构起可读名）
+                if (evName.isNotEmpty() && node.has("Id")) {
+                    val evId = node.opt("Id").toString().toLongOrNull()
+                    if (evId != null && evId > 0) eventNames.putIfAbsent(evId, evName)
+                }
                 if (evName.isNotEmpty() &&
                     (node.has("ReferencedStreamedFiles") || node.has("IncludedMemoryFiles"))
                 ) {
@@ -315,10 +342,10 @@ object WwiseConverter {
                         }
                     }
                 }
-                for (key in node.keys()) walkJson(node.get(key), names, dirs, events)
+                for (key in node.keys()) walkJson(node.get(key), names, dirs, events, eventNames)
             }
             is org.json.JSONArray -> {
-                for (i in 0 until node.length()) walkJson(node.get(i), names, dirs, events)
+                for (i in 0 until node.length()) walkJson(node.get(i), names, dirs, events, eventNames)
             }
         }
     }
@@ -332,11 +359,314 @@ object WwiseConverter {
 
     /** 路径 → 归一化目录（a\\b\\c.wav → a/b；顶层返回空串；每段做合法化） */
     private fun sanitizeDir(path: String): String {
-        val dir = path.substringBeforeLast('\\').substringBeforeLast('/')
-        if (dir == path || dir.isEmpty()) return ""
-        return dir.split('\\', '/')
+        // 先统一分隔符再取目录：链式 substringBeforeLast 在混合分隔符
+        // （如 sounds/ui\button.wav）下会丢失 ui 层级
+        val normalized = path.replace('\\', '/')
+        val dir = normalized.substringBeforeLast('/')
+        if (dir == normalized || dir.isEmpty()) return ""
+        return dir.split('/')
             .filter { it.isNotBlank() }
             .joinToString("/") { seg -> seg.replace(Regex("[\\/:*?\"<>|]"), "_").take(60) }
+    }
+
+    // ---------- HIRC 事件结构（SoundbanksInfo 无法覆盖时的兜底分组） ----------
+
+    /** HIRC 中可遍历的对象类型：2=Sound 3=Event 4=随机容器 5=开关容器 6=ActorMixer 9=混合容器
+     *  （1=Settings、7/8=总线不含媒体且会串组，排除） */
+    private val hircTraversable = setOf(2, 3, 4, 5, 6, 9)
+
+    private class HircObj(val type: Int, val off: Int, val len: Int)
+
+    /**
+     * 遍历 HIRC 事件区：从 roots（事件 id）出发收集各事件子树的媒体 id。
+     * 返回 rootId → 媒体 id 集合（媒体 id 与 Bank.entries.id 同一表示法）。
+     *
+     * 适用场景：SoundbanksInfo.json 与 bank 版本错配（如整库重建的语音 mod），
+     * JSON 查不到媒体 id 时，用 bank 内置的 事件→容器→Sound 引用链分组。
+     * 实测（Wwise 2019 与 2021 两种 bank）：对象表 = u32 count + 对象循环
+     * {u8 type, u32 len, payload}；每个对象 payload+0 是其 objId；
+     * Sound 对象 payload 前 24 字节内的某 u32 等于其媒体 id（DIDX 可查）。
+     */
+    fun parseHircGroups(bank: Bank, roots: Collection<Long>): Map<Long, Set<Long>> {
+        if (bank.hircSize <= 0 || bank.hircStart < 0) return emptyMap()
+        val data = bank.original
+        val start = bank.hircStart
+        val end = (start + bank.hircSize).coerceAtMost(data.size)
+        if (start + 8 > end) return emptyMap()
+        val count = readU32(data, start)
+        if (count <= 0 || count > 500_000) return emptyMap()
+
+        // 对象表
+        val objs = ArrayList<HircObj>(count.coerceAtMost(100_000))
+        var pos = start + 4
+        var i = 0
+        while (i < count) {
+            if (pos + 5 > end) break
+            val t = data[pos].toInt() and 0xFF
+            val len = readU32(data, pos + 1)
+            if (len < 0 || pos + 5 + len > end) break
+            objs.add(HircObj(t, pos + 5, len))
+            pos += 5 + len
+            i++
+        }
+        if (objs.isEmpty()) return emptyMap()
+
+        // objId（无符号）→ 对象
+        val byId = HashMap<Long, HircObj>(objs.size * 2)
+        for (o in objs) {
+            if (o.len >= 4) {
+                val id = readU32(data, o.off).toLong() and 0xFFFFFFFFL
+                if (!byId.containsKey(id)) byId[id] = o
+            }
+        }
+        // 媒体 id 集合（无符号；Bank.entries.id 可能有符号，统一转无符号）
+        val mediaUnsigned = HashSet<Long>(bank.entries.size * 2)
+        for (e in bank.entries) mediaUnsigned.add(e.id and 0xFFFFFFFFL)
+        // Sound 对象 objId → 媒体 id（无符号）
+        val soundMedia = HashMap<Long, Long>()
+        for (o in objs) {
+            if (o.type != 2 || o.len < 8) continue
+            val oid = readU32(data, o.off).toLong() and 0xFFFFFFFFL
+            val lim = minOf(o.len, 24)
+            var k = 4
+            while (k + 4 <= lim) {
+                val v = readU32(data, o.off + k).toLong() and 0xFFFFFFFFL
+                if (mediaUnsigned.contains(v)) {
+                    soundMedia[oid] = v
+                    break
+                }
+                k++
+            }
+        }
+        // 子树递归收集（防环）
+        fun collect(oid: Long, visited: MutableSet<Long>, out: MutableSet<Long>) {
+            if (!visited.add(oid)) return
+            val o = byId[oid] ?: return
+            if (o.type !in hircTraversable) return
+            if (o.type == 2) {
+                val m = soundMedia[oid]
+                if (m != null) out.add(m)
+                return
+            }
+            var k = 4
+            while (k + 4 <= o.len) {
+                val v = readU32(data, o.off + k).toLong() and 0xFFFFFFFFL
+                if (v != 0L && byId.containsKey(v)) collect(v, visited, out)
+                k++
+            }
+        }
+        // 无符号 → Bank.entries 表示法
+        fun toSigned(v: Long): Long = if (v > 0x7FFFFFFFL) v - 0x100000000L else v
+
+        val result = LinkedHashMap<Long, Set<Long>>()
+        for (root in roots) {
+            val rootU = root and 0xFFFFFFFFL
+            if (!byId.containsKey(rootU)) continue
+            val out = HashSet<Long>()
+            collect(rootU, HashSet(), out)
+            if (out.isNotEmpty()) {
+                val signed = LinkedHashSet<Long>(out.size)
+                for (m in out) signed.add(toSigned(m))
+                result[rootU] = signed
+            }
+        }
+        return result
+    }
+
+    /** HIRC 内全部对象的 objId 集合（无符号；用于找出 JSON 事件 id 在 bank 内对应的对象） */
+    fun hircObjectIds(bank: Bank): Set<Long> {
+        val out = HashSet<Long>()
+        if (bank.hircSize <= 0 || bank.hircStart < 0) return out
+        val data = bank.original
+        val start = bank.hircStart
+        val end = (start + bank.hircSize).coerceAtMost(data.size)
+        if (start + 8 > end) return out
+        val count = readU32(data, start)
+        if (count <= 0 || count > 500_000) return out
+        var pos = start + 4
+        var i = 0
+        while (i < count) {
+            if (pos + 5 > end) break
+            val len = readU32(data, pos + 1)
+            if (len < 0 || pos + 5 + len > end) break
+            if (len >= 4) out.add(readU32(data, pos + 5).toLong() and 0xFFFFFFFFL)
+            pos += 5 + len
+            i++
+        }
+        return out
+    }
+
+    // ---------- 全新 ID 重建（从零建包） ----------
+
+    /**
+     * 全新 ID 重建 bank：结构克隆自 bank 自带 HIRC，等效于 mod 作者在 Wwise 里
+     * 重新生成的包——
+     * - 被替换的媒体与全部内部对象（事件根/总线除外）分配全新 ID
+     * - 事件根 ID（游戏触发用）与总线(t7) ID 保留
+     * - 未替换的媒体保留原 ID 与原数据，事件结构完整可用
+     * 与 repack 的区别：repack 原样保留全部 ID；本函数产出的包不与任何已装
+     * 包共享媒体/内部对象 ID，分发更干净。
+     *
+     * protectedIds：事件根 ID（SoundbanksInfo 的 IncludedEvents Id ∩ bank 对象）。
+     * 为空时按启发式保留全部 type-4（本游戏事件容器）ID。
+     * bank 无 HIRC 时抛异常（调用方应回退 repack）。
+     */
+    fun buildBank(bank: Bank, replacements: Map<Long, ByteArray>, protectedIds: Set<Long>): RepackResult {
+        if (bank.isPck || bank.hircStart < 0 || bank.hircSize <= 0) {
+            // 无 HIRC（pck / 纯媒体库）无从重建，交由 repack 语义兜底
+            return repack(bank, replacements)
+        }
+        val data = bank.original
+        // 分段扫描：BKHD 头区间到 DIDX 魔数为止
+        var didxMagic = -1
+        var pos = 0
+        while (pos + 8 <= data.size) {
+            val magic = String(data, pos, 4, Charsets.US_ASCII)
+            if (magic == "DIDX") {
+                didxMagic = pos
+                break
+            }
+            pos += 8 + readU32(data, pos + 4)
+        }
+        if (didxMagic < 0) throw IllegalStateException(L.s(R.string.e_not_pck))
+
+        // HIRC 对象表
+        val hStart = bank.hircStart
+        val hEnd = minOf(hStart + bank.hircSize, data.size)
+        val count = readU32(data, hStart)
+        val objs = ArrayList<HircObj>(count.coerceAtMost(100_000))
+        var p = hStart + 4
+        var i = 0
+        while (i < count) {
+            if (p + 5 > hEnd) break
+            val t = data[p].toInt() and 0xFF
+            val len = readU32(data, p + 1)
+            if (len < 0 || p + 5 + len > hEnd) break
+            objs.add(HircObj(t, p + 5, len))
+            p += 5 + len
+            i++
+        }
+        // ID 映射：保留 = 总线(7) ∪ protectedIds（空则启发式保留全部 type-4）
+        val keep = HashSet<Long>()
+        for (o in objs) {
+            if (o.len < 4) continue
+            val oid = readU32(data, o.off).toLong() and 0xFFFFFFFFL
+            if (o.type == 7 || protectedIds.contains(oid)) keep.add(oid)
+            if (protectedIds.isEmpty() && o.type == 4) keep.add(oid)
+        }
+        val idMap = HashMap<Long, Long>(objs.size * 2)
+        var nextObj = 0x6A000001L
+        for (o in objs) {
+            if (o.len < 4) continue
+            val oid = readU32(data, o.off).toLong() and 0xFFFFFFFFL
+            if (keep.contains(oid)) {
+                idMap[oid] = oid
+            } else {
+                idMap[oid] = nextObj
+                nextObj++
+            }
+        }
+        // 媒体映射：替换 → 全新 ID；未替换 → 保留
+        val mediaMap = HashMap<Long, Long>(bank.entries.size * 2)
+        var nextMedia = 0x5B000001L
+        for (e in bank.entries) {
+            val mid = e.id and 0xFFFFFFFFL
+            if (replacements.containsKey(e.id)) {
+                mediaMap[mid] = nextMedia
+                nextMedia++
+            } else {
+                mediaMap[mid] = mid
+            }
+        }
+        // DIDX + DATA（条目顺序重排，偏移连续）
+        val didxBuf = java.io.ByteArrayOutputStream(12 * bank.entries.size)
+        val dataBuf = java.io.ByteArrayOutputStream(data.size / 2)
+        var dataOff = 0L
+        var truncated = 0
+        for (e in bank.entries) {
+            val rep = replacements[e.id]
+            val bytes: ByteArray
+            if (rep != null) {
+                // 截断预取条目：与 repack 同语义，替换内容截到原存储大小
+                val orig = bank.extract(e)
+                if (isTruncatedWem(orig) && rep.size > e.size) {
+                    bytes = rep.copyOf(e.size)
+                    truncated++
+                } else {
+                    bytes = rep
+                }
+            } else {
+                bytes = bank.extract(e)
+            }
+            writeU32LE(didxBuf, mediaMap[e.id and 0xFFFFFFFFL] ?: e.id and 0xFFFFFFFFL)
+            writeU32LE(didxBuf, dataOff)
+            writeU32LE(didxBuf, bytes.size.toLong())
+            dataBuf.write(bytes)
+            dataOff += bytes.size
+        }
+        // HIRC（对象保持原顺序，payload 内的旧 ID 全部替换）
+        val hircBuf = java.io.ByteArrayOutputStream(bank.hircSize + 16)
+        writeU32LE(hircBuf, objs.size.toLong())
+        for (o in objs) {
+            hircBuf.write(o.type)
+            writeU32LE(hircBuf, o.len.toLong())
+            val payload = data.copyOfRange(o.off, o.off + o.len)
+            var k = 0
+            while (k + 4 <= o.len) {
+                val v = readU32(payload, k).toLong() and 0xFFFFFFFFL
+                val nv = idMap[v] ?: mediaMap[v]
+                if (nv != null) putU32LE(payload, k, nv)
+                k++
+            }
+            hircBuf.write(payload)
+        }
+        // 组装
+        val out = java.io.ByteArrayOutputStream(data.size / 2 + 64)
+        out.write(data, 0, didxMagic)
+        out.write("DIDX".toByteArray(Charsets.US_ASCII))
+        writeU32LE(out, didxBuf.size().toLong())
+        out.write(didxBuf.toByteArray())
+        out.write("DATA".toByteArray(Charsets.US_ASCII))
+        writeU32LE(out, dataBuf.size().toLong())
+        out.write(dataBuf.toByteArray())
+        out.write("HIRC".toByteArray(Charsets.US_ASCII))
+        writeU32LE(out, hircBuf.size().toLong())
+        out.write(hircBuf.toByteArray())
+        return RepackResult(out.toByteArray(), truncated)
+    }
+
+    private fun writeU32LE(out: java.io.ByteArrayOutputStream, v: Long) {
+        for (shift in 0..24 step 8) out.write(((v shr shift) and 0xFF).toInt())
+    }
+
+    private fun putU32LE(b: ByteArray, off: Int, v: Long) {
+        for (shift in 0..24 step 8) b[off + shift / 8] = ((v shr shift) and 0xFF).toByte()
+    }
+
+    /** HIRC 内 Event(type 3) 对象的事件 id 列表（无 JSON 时的分组根） */
+    fun hircEventObjectIds(bank: Bank): List<Long> {
+        if (bank.hircSize <= 0 || bank.hircStart < 0) return emptyList()
+        val data = bank.original
+        val start = bank.hircStart
+        val end = (start + bank.hircSize).coerceAtMost(data.size)
+        if (start + 8 > end) return emptyList()
+        val count = readU32(data, start)
+        if (count <= 0 || count > 500_000) return emptyList()
+        val out = ArrayList<Long>()
+        var pos = start + 4
+        var i = 0
+        while (i < count) {
+            if (pos + 5 > end) break
+            val t = data[pos].toInt() and 0xFF
+            val len = readU32(data, pos + 1)
+            if (len < 0 || pos + 5 + len > end) break
+            if (t == 3 && len >= 4) {
+                out.add(readU32(data, pos + 5).toLong() and 0xFFFFFFFFL)
+            }
+            pos += 5 + len
+            i++
+        }
+        return out
     }
 
     /** 检测 wem 是否为 PCM（fmt codec 0x0001，可直接当 .wav 用） */
@@ -357,6 +687,84 @@ object WwiseConverter {
             pos += 8 + sz
         }
         return false
+    }
+
+    // ---------- Wwise 2021+ 新版 PCM（codec 0xFFFE，fmt 24 字节 + JUNK，data 为裸采样） ----------
+
+    /** 检测 Wwise 2021+ 的新版 PCM wem（fmt codec 0xFFFE） */
+    fun isWwiseNewPcmWem(data: ByteArray): Boolean {
+        if (data.size < 32) return false
+        if (!(data[0] == 'R'.code.toByte() && data[1] == 'I'.code.toByte() &&
+                data[2] == 'F'.code.toByte() && data[3] == 'F'.code.toByte())) return false
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val id = String(data, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(data, pos + 4)
+            if (id == "fmt ") {
+                if (pos + 8 + 2 > data.size) return false
+                val codec = (data[pos + 8].toInt() and 0xFF) or
+                    ((data[pos + 9].toInt() and 0xFF) shl 8)
+                return codec == 0xFFFE
+            }
+            pos += 8 + sz
+        }
+        return false
+    }
+
+    /**
+     * 0xFFFE PCM wem → 标准 WAV。
+     * Wwise 2021+ 用 0xFFFE 标记 PCM，fmt 带 cbSize=6 的非标准扩展与 JUNK 块，
+     * 不能直接改名当 wav 用：这里解析字段后重建干净的最小 WAV。
+     */
+    fun wemNewPcmToWav(data: ByteArray): ByteArray {
+        var channels = 1
+        var rate = 44100
+        var bits = 16
+        var align = 2
+        var dataOff = -1
+        var dataLen = 0
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val id = String(data, pos, 4, Charsets.US_ASCII)
+            val sz = readU32(data, pos + 4).toInt()
+            if (id == "fmt " && pos + 24 <= data.size) {
+                channels = (data[pos + 10].toInt() and 0xFF) or
+                    ((data[pos + 11].toInt() and 0xFF) shl 8)
+                rate = readU32(data, pos + 12).toInt()
+                align = (data[pos + 20].toInt() and 0xFF) or
+                    ((data[pos + 21].toInt() and 0xFF) shl 8)
+                bits = (data[pos + 22].toInt() and 0xFF) or
+                    ((data[pos + 23].toInt() and 0xFF) shl 8)
+            } else if (id == "data") {
+                dataOff = pos + 8
+                dataLen = minOf(sz, data.size - pos - 8)
+            }
+            if (sz < 0) break
+            pos += 8 + sz
+        }
+        if (dataOff < 0 || dataLen <= 0 || channels < 1 || rate < 8000)
+            throw IllegalArgumentException(L.s(R.string.e_no_data_chunk))
+        // 防御：block align 异常时按声道数×位深推算
+        val safeAlign = if (align == channels * (bits / 8) && align > 0) align
+            else channels * (bits / 8)
+        val out = java.io.ByteArrayOutputStream(64 + dataLen)
+        val u32 = { v: Int -> byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte(), ((v shr 16) and 0xFF).toByte(), ((v shr 24) and 0xFF).toByte()) }
+        val u16 = { v: Int -> byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte()) }
+        out.write("RIFF".toByteArray(Charsets.US_ASCII))
+        out.write(u32(36 + dataLen))
+        out.write("WAVE".toByteArray(Charsets.US_ASCII))
+        out.write("fmt ".toByteArray(Charsets.US_ASCII))
+        out.write(u32(16))
+        out.write(u16(0x0001))                       // 标准 PCM 标记
+        out.write(u16(channels))
+        out.write(u32(rate))
+        out.write(u32(rate * safeAlign))
+        out.write(u16(safeAlign))
+        out.write(u16(bits))
+        out.write("data".toByteArray(Charsets.US_ASCII))
+        out.write(u32(dataLen))
+        out.write(data, dataOff, dataLen)
+        return out.toByteArray()
     }
 
     // ---------- PtADPCM（Wwise 2019.1+ 语音编码，fmt codec 0x8311，Platinum 自定义 ADPCM） ----------
@@ -1079,6 +1487,9 @@ object WwiseConverter {
         val bs1 = (idP[28].toInt() shr 4) and 0x0F
         val totalSamples = parsed.pages.last().granule
         if (totalSamples <= 0) throw IllegalArgumentException(L.s(R.string.e_no_granule))
+        // u32 字段上限防护：超长音频（>约 13.4 小时 @44.1kHz）直接拒绝，
+        // 避免 toInt() 有符号截断写出错误的 totalSamples
+        if (totalSamples > 0xFFFFFFFFL) throw IllegalArgumentException(L.s(R.string.e_audio_too_long))
         if (sampleRate <= 0) throw IllegalArgumentException(L.s(R.string.x_rate_prefix) + sampleRate + "）")
 
         // Wwise 2019 channelMask 编码（低字节 = 声道数，高字节 = 布局类型）
@@ -1242,6 +1653,9 @@ object WwiseConverter {
                 if (lacing < 255) { packets.add(cur); building = false }
             }
         }
+        // 边界修复：最后一个音频包可跨末页边界（段表以 255 结尾），
+        // 循环结束后 building 仍为 true 时必须补收，否则 WEM 结尾截断
+        if (building && cur.isNotEmpty()) packets.add(cur)
         return OggParsed(pages, packets)
     }
 
@@ -1340,6 +1754,8 @@ object WwiseConverter {
             throw IllegalArgumentException(L.s(R.string.x_cb_limit) + dims + " entries=" + entries + "）")
         val w = BitWriter()
         w.write(dims, 4)
+        // 14-bit 写宽 → entries 上限 16383，这是 Wwise packed_codebooks
+        // 格式的固有限制（条目数以 14bit 编码进码书 blob），非本实现约束
         w.write(entries, 14)
         val ordered = bits.get(p); p += 1
         w.write(if (ordered) 1 else 0, 1)
@@ -1594,6 +2010,9 @@ object WwiseConverter {
         }
         // OGG 尾部 1-bit framing：WEM 不含，跳过
 
+        // modeCount=1 时 ilog(0)=0 → modeBits=0：transformAudioPacketMod
+        // 中 bits.read(1, 0) 返回 0（读 0 位恒为 0），单模式包恰好不需要
+        // mode 位——这是有意依赖的边界行为，勿改 read 签名默认值
         return SetupTransform(w.toByteArray(), ilog(modeCount - 1), blockFlags)
     }
 
@@ -1617,6 +2036,139 @@ object WwiseConverter {
         }
         return w.toByteArray()
     }
+
+    // ---------- 打包模板与智能匹配 ----------
+
+    /** 匹配结果：目标 id → (源文件名, 字节) */
+    class MatchOutcome(
+        val matched: LinkedHashMap<Long, Pair<String, ByteArray>>,
+        val unmatched: MutableList<String>,
+        val conflicts: MutableList<String>
+    )
+
+    private val langTagRe = Regex(
+        "(^|[._\\-\\s])(en|us|zh|ru|jp|kr|de|fr|es|it|pl|tr|pt|br|cn|tw|english|russian|chinese|japanese|korean|spanish|german|french|polish|turkish)\\s*$"
+    )
+    private val nonAlnumRe = Regex("[^a-z0-9\\u4e00-\\u9fff]")
+
+    /** 归一化名称：小写 → 去扩展名 → 剥离结尾语言标签 → 去所有非字母数字（保留中文） */
+    fun normalizeForMatch(raw: String): String {
+        var s = raw.substringBeforeLast('.').lowercase()
+        s = langTagRe.replace(s, "")
+        return nonAlnumRe.replace(s, "")
+    }
+
+    /** 匹配索引：从目标库 + SoundbanksInfo 建立的多种反查表 */
+    class MatchIndex(
+        val ids: HashSet<Long>,
+        val byNameExact: HashMap<String, Long>,
+        val byNameNorm: HashMap<String, Long>,
+        val byDirNameNorm: HashMap<String, Long>,
+        val byEventNorm: HashMap<String, Long>,
+        val names: Map<Long, String>,
+        val dirs: Map<Long, String>,
+        val events: Map<Long, List<String>>
+    )
+
+    fun buildMatchIndex(bank: Bank, info: SoundbanksInfo): MatchIndex {
+        val byNameExact = HashMap<String, Long>()
+        val byNameNorm = HashMap<String, Long>()
+        val byDirNameNorm = HashMap<String, Long>()
+        val byEventNorm = HashMap<String, Long>()
+        for (e in bank.entries) {
+            val n = info.names[e.id] ?: continue
+            byNameExact.putIfAbsent(n, e.id)
+            byNameExact.putIfAbsent(n.lowercase(), e.id)
+            val norm = normalizeForMatch(n)
+            if (norm.isNotEmpty()) byNameNorm.putIfAbsent(norm, e.id)
+            val d = info.dirs[e.id].orEmpty().lowercase()
+            if (d.isNotEmpty() && norm.isNotEmpty()) {
+                byDirNameNorm.putIfAbsent(d + "/" + norm, e.id)
+                byDirNameNorm.putIfAbsent(d.substringAfterLast('/') + "/" + norm, e.id)
+            }
+            for (ev in info.events[e.id].orEmpty()) {
+                val en = normalizeForMatch(ev)
+                if (en.isNotEmpty()) byEventNorm.putIfAbsent(en, e.id)
+            }
+        }
+        return MatchIndex(
+            bank.entries.map { it.id }.toHashSet(), byNameExact, byNameNorm,
+            byDirNameNorm, byEventNorm, info.names, info.dirs, info.events
+        )
+    }
+
+    /**
+     * 单文件匹配（按优先级）：
+     *  1) 文件名数字前缀 = 目标库 ID
+     *  2) 原名精确（json 名，大小写不敏感）
+     *  3) 归一化名（去分隔符 / 语言标签）
+     *  4) 父目录 + 归一化名（逐级回退）
+     *  5) 事件名归一化
+     */
+    fun matchOne(fileName: String, relDir: String, index: MatchIndex): Long? {
+        val (id, parsedName) = parseWemFileName(fileName)
+        if (id != null && index.ids.contains(id)) return id
+        val bare = fileName.substringBeforeLast('.')
+        for (c in listOfNotNull(parsedName, bare)) {
+            index.byNameExact[c]?.let { return it }
+            index.byNameExact[c.lowercase()]?.let { return it }
+        }
+        val norm = normalizeForMatch(bare)
+        if (norm.isEmpty()) return null
+        index.byNameNorm[norm]?.let { return it }
+        index.byEventNorm[norm]?.let { return it }
+        var d = relDir.trim('/').lowercase()
+        while (d.isNotEmpty()) {
+            index.byDirNameNorm[d + "/" + norm]?.let { return it }
+            val cut = d.indexOf('/')
+            if (cut < 0) break
+            d = d.substring(cut + 1)
+        }
+        return null
+    }
+
+    /** 批量匹配：保持输入顺序，同目标后者覆盖前者并记录冲突 */
+    fun matchReplacements(
+        files: List<Triple<String, String, ByteArray>>,
+        index: MatchIndex
+    ): MatchOutcome {
+        val matched = LinkedHashMap<Long, Pair<String, ByteArray>>()
+        val unmatched = ArrayList<String>()
+        val conflicts = ArrayList<String>()
+        for ((name, dir, bytes) in files) {
+            val target = matchOne(name, dir, index)
+            if (target == null) {
+                unmatched.add(if (dir.isEmpty()) name else dir + "/" + name)
+                continue
+            }
+            matched[target]?.let { conflicts.add(it.first + " → " + name) }
+            matched[target] = name to bytes
+        }
+        return MatchOutcome(matched, unmatched, conflicts)
+    }
+
+    /** 生成模板清单 CSV（带 BOM，Excel 直接可读） */
+    fun buildManifestCsv(bank: Bank, info: SoundbanksInfo, header: List<String>): ByteArray {
+        val sb = StringBuilder("\uFEFF")
+        sb.append(header.joinToString(",")).append('\n')
+        for (e in bank.entries) {
+            val n = info.names[e.id].orEmpty()
+            val d = info.dirs[e.id].orEmpty()
+            val ev = info.events[e.id].orEmpty().joinToString("; ")
+            sb.append(csvRow(listOf(e.id.toString(), n, d, ev, exportTemplateName(e.id, n)))).append('\n')
+        }
+        return sb.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    private fun csvRow(cells: List<String>): String = cells.joinToString(",") { c ->
+        if (c.contains(',') || c.contains('"') || c.contains('\n'))
+            "\"" + c.replace("\"", "\"\"") + "\""
+        else c
+    }
+
+    /** 模板内目标文件名：{id}_{原名}.wem；无名字时用 {id}.wem */
+    fun exportTemplateName(id: Long, name: String?): String =
+        if (name.isNullOrEmpty()) id.toString() + ".wem" else id.toString() + "_" + name + ".wem"
 
     // ---------- 工具 ----------
 
