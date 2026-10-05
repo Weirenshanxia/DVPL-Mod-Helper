@@ -1,17 +1,22 @@
 package com.dvpl.modhelper
 
 import android.content.Context
+import android.graphics.SurfaceTexture
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLSurface
 import android.opengl.GLES20
-import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import android.util.Log
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.TextureView
 import com.dvpl.modhelper.codec.ScgConverter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import javax.microedition.khronos.egl.EGLConfig
-import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.tan
@@ -20,8 +25,13 @@ import kotlin.math.tan
  * OpenGL 3D 预览（GLES 2.0）：真深度缓冲 + 双方向光着色，无面数上限。
  * 交互：单指拖动旋转，双指捏合缩放。
  * 显示规则：solo 模式只高亮该组；否则勾选组实心、未勾选组幽灵灰；全不选时整车幽灵。
+ *
+ * 用 TextureView + 自管 EGL14 渲染线程而非 GLSurfaceView：部分 OEM 合成器
+ * （实测天玑820 Mali-G57）在 AlertDialog 子窗口里对 SurfaceView 的"开洞"范围
+ * 计算错误，把整个对话框背景当洞抠掉 → 界面背景变透明、只残预览框与零星文字。
+ * TextureView 不开洞（作为普通纹理混入窗口层），从根上规避该类问题。
  */
-class ScgGlView(context: Context) : GLSurfaceView(context) {
+class ScgGlView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
 
     private val renderer = Renderer()
     private var lastX = 0f
@@ -30,6 +40,13 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
     @Volatile var yaw = 38f
     @Volatile var pitch = -62f
     @Volatile var zoom = 1f
+
+    @Volatile private var surfaceW = 1
+    @Volatile private var surfaceH = 1
+    @Volatile private var renderRequested = false
+    @Volatile private var threadExit = false
+    private val renderLock = Object()
+    private var renderThread: Thread? = null
 
     private val scaleDetector = ScaleGestureDetector(context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -42,10 +59,8 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
         })
 
     init {
-        setEGLContextClientVersion(2)
-        setEGLConfigChooser(8, 8, 8, 0, 16, 0)
-        setRenderer(renderer)
-        renderMode = RENDERMODE_WHEN_DIRTY
+        isOpaque = true   // 内容不透明（clear alpha=1），可免一层合成混合
+        surfaceTextureListener = this
     }
 
     fun setScene(groups: List<ScgConverter.ScgGroup>) {
@@ -57,6 +72,9 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
         renderer.display(selectedIds, soloId)
         requestRender()
     }
+
+    /** 停止渲染线程并释放 EGL 资源（AndroidView onRelease / 对话框关闭时调用） */
+    fun onPause() = stopRenderThread()
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         scaleDetector.onTouchEvent(e)
@@ -78,7 +96,126 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
         return true
     }
 
-    // ---------- 场景数据 ----------
+    // ---------- SurfaceTexture 生命周期 ----------
+
+    override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+        surfaceW = max(1, width); surfaceH = max(1, height)
+        startRenderThread(st)
+    }
+
+    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+        surfaceW = max(1, width); surfaceH = max(1, height)
+        requestRender()
+    }
+
+    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+        stopRenderThread()
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+
+    // ---------- 渲染线程 ----------
+
+    fun requestRender() {
+        synchronized(renderLock) { renderRequested = true; renderLock.notifyAll() }
+    }
+
+    private fun startRenderThread(st: SurfaceTexture) {
+        stopRenderThread()
+        threadExit = false
+        renderRequested = true
+        val w0 = surfaceW; val h0 = surfaceH
+        val t = Thread {
+            val egl = EglWindow()
+            if (!egl.create(st)) {
+                Log.e("ScgGlView", "EGL 初始化失败: " + EGL14.eglGetError())
+                egl.destroy()
+                return@Thread
+            }
+            renderer.onSurfaceCreated()
+            renderer.onSurfaceChanged(w0, h0)
+            var running = true
+            while (running) {
+                var shouldDraw = false
+                synchronized(renderLock) {
+                    while (!renderRequested && !threadExit) {
+                        try { renderLock.wait() } catch (_: InterruptedException) { }
+                    }
+                    if (threadExit) running = false
+                    else { renderRequested = false; shouldDraw = true }
+                }
+                if (!running) break
+                val w = surfaceW; val h = surfaceH
+                renderer.onDrawFrame(w, h)
+                if (!egl.swap()) {
+                    Log.e("ScgGlView", "swapBuffers 失败: " + EGL14.eglGetError())
+                    running = false
+                }
+            }
+            egl.destroy()
+        }
+        t.name = "ScgGlRender"
+        t.isDaemon = true
+        renderThread = t
+        t.start()
+    }
+
+    private fun stopRenderThread() {
+        val t = renderThread ?: return
+        synchronized(renderLock) { threadExit = true; renderLock.notifyAll() }
+        try { t.join(3000) } catch (_: InterruptedException) { }
+        renderThread = null
+    }
+
+    /** 最小 EGL 封装：window surface 基于 SurfaceTexture，显式 0 位 alpha */
+    private class EglWindow {
+        var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+        var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+        var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+
+        fun create(st: SurfaceTexture): Boolean {
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) return false
+            if (!EGL14.eglInitialize(eglDisplay, IntArray(2), 0, null, 0)) return false
+            val cfgAttr = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 0, EGL14.EGL_DEPTH_SIZE, 16,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE)
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val num = IntArray(1)
+            if (!EGL14.eglChooseConfig(eglDisplay, cfgAttr, 0, configs, 0, 1, num, 0) ||
+                num[0] < 1) return false
+            val ctxAttr = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+            eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
+            if (eglContext == EGL14.EGL_NO_CONTEXT) return false
+            eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], st,
+                intArrayOf(EGL14.EGL_NONE), 0)
+            if (eglSurface == EGL14.EGL_NO_SURFACE) return false
+            return EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        }
+
+        fun swap(): Boolean = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+
+        fun destroy() {
+            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                if (eglSurface != EGL14.EGL_NO_SURFACE)
+                    EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                if (eglContext != EGL14.EGL_NO_CONTEXT)
+                    EGL14.eglDestroyContext(eglDisplay, eglContext)
+                EGL14.eglTerminate(eglDisplay)
+                EGL14.eglReleaseThread()
+            }
+            eglDisplay = EGL14.EGL_NO_DISPLAY
+            eglContext = EGL14.EGL_NO_CONTEXT
+            eglSurface = EGL14.EGL_NO_SURFACE
+        }
+    }
+
+    // ---------- 场景数据与绘制（与旧 GLSurfaceView 版逐字节等价） ----------
 
     private class Part(
         val gid: Long,
@@ -92,7 +229,7 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
         val cx: Float, val cy: Float, val cz: Float, val radius: Float
     )
 
-    private inner class Renderer : GLSurfaceView.Renderer {
+    private inner class Renderer {
         @Volatile private var pendingGroups: List<ScgConverter.ScgGroup>? = null
         @Volatile private var selected: Set<Long> = emptySet()
         @Volatile private var solo: Long? = null
@@ -112,7 +249,7 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
         fun setScene(groups: List<ScgConverter.ScgGroup>) { pendingGroups = groups }
         fun display(selectedIds: Set<Long>, soloId: Long?) { selected = selectedIds; solo = soloId }
 
-        override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        fun onSurfaceCreated() {
             program = buildProgram()
             aPos = GLES20.glGetAttribLocation(program, "aPos")
             aNorm = GLES20.glGetAttribLocation(program, "aNorm")
@@ -123,12 +260,13 @@ class ScgGlView(context: Context) : GLSurfaceView(context) {
             GLES20.glClearColor(0.07f, 0.08f, 0.10f, 1f)
         }
 
-        override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        fun onSurfaceChanged(width: Int, height: Int) {
             vpW = max(1, width); vpH = max(1, height)
             GLES20.glViewport(0, 0, vpW, vpH)
         }
 
-        override fun onDrawFrame(gl: GL10?) {
+        fun onDrawFrame(width: Int, height: Int) {
+            if (vpW != width || vpH != height) onSurfaceChanged(width, height)
             pendingGroups?.let { buildAndUpload(it); pendingGroups = null }
             val sc = scene ?: run { GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT); return }
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)

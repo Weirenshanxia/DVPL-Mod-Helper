@@ -42,7 +42,6 @@ object ScgConverter {
      * 注意: 皮肤件 UV 常平铺到 0..2 (u 最大到 1.995)，属正常现象。
      */
     private val UV_LAYOUT = mapOf(
-        3 to Pair(12, true),
         11 to Pair(24, false),
         395 to Pair(24, false),
         399 to Pair(24, false),
@@ -75,6 +74,8 @@ object ScgConverter {
 
     /** UV 布局查询: 已知格式用表, 未知格式运行时探测并缓存（一劳永逸应对新格式） */
     private fun uvLayoutFor(g: ScgGroup): Pair<Int, Boolean>? {
+        // vfmt=3 的 24B 形态: pos(12) + normal f32×3(12), 无 UV 字节（实测尾三字恒为单位向量）
+        if (g.vertexFormat == 3 && g.stride == 24) return null
         UV_LAYOUT[g.vertexFormat]?.let { return it }
         val cached = uvAutoDetected[g.vertexFormat]
         if (cached != null) return if (cached === NO_UV) null else cached as Pair<Int, Boolean>
@@ -159,6 +160,8 @@ object ScgConverter {
         val vertices: ByteArray,
         val indices: ByteArray
     ) {
+        // 注: vfmt=3 实测存在 16B 与 24B 两种形态（Werewolf 为 24B=pos+normal f32×3）,
+        // stride 取值以数据自校验为准, 见下方 stride 的实现。
         /** sc2 解析出的材质名（原始映射，未经几何校验，不可直接显示） */
         var sc2Name: String? = null
 
@@ -171,9 +174,21 @@ object ScgConverter {
         /** 包围盒 [mnX,mnY,mnZ,mxX,mxY,mxZ]，assignLod() 时计算 */
         var bbox: FloatArray? = null
 
-        /** 顶点步长（字节） */
+        /**
+         * 顶点步长（字节）。
+         * 表值仅作首选；若顶点区能整除出不同的步长（12..128 字节），以实测数据为准——
+         * Werewolf 的 vfmt=3 实测 24B（pos12+normal12）而表记 16B，按表读会把法线/
+         * UV 位当位置读，部件渲染成一坨。此规则同时兼容表值正确的其它格式。
+         */
         val stride: Int
-            get() = STRIDES[vertexFormat] ?: if (vertexCount > 0) vertices.size / vertexCount else 0
+            get() {
+                val t = STRIDES[vertexFormat]
+                if (vertexCount > 0) {
+                    val q = vertices.size / vertexCount
+                    if (vertices.size % vertexCount == 0 && q in 12..128 && q != t) return q
+                }
+                return t ?: if (vertexCount > 0) vertices.size / vertexCount else 0
+            }
     }
 
     // ---------- 底层读取 ----------
