@@ -299,12 +299,12 @@ object DdsConverter {
             curBitmap.getPixels(pixels, 0, curW, 0, 0, curW, curH)
             encodeBlocksToStream(pixels, curW, curH, format, out)
             if (it < mips - 1) {
-                val nw = maxOf(1, (curW + 1) / 2); val nh = maxOf(1, (curH + 1) / 2)
-                val scaled = Bitmap.createScaledBitmap(curBitmap, nw, nh, true)
+                // 纯像素域盒式滤波（不走 Canvas：直通位图上 canvas 在部分 ROM 直接失败）
+                val scaled = PvrConverter.halveBitmap(curBitmap)
                 if (!isFirst) curBitmap.recycle()
                 curBitmap = scaled
                 isFirst = false
-                curW = nw; curH = nh
+                curW = scaled.width; curH = scaled.height
             }
         }
         if (!isFirst) curBitmap.recycle()

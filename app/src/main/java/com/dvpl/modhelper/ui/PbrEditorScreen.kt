@@ -130,7 +130,8 @@ fun PbrEditorScreen(
                 val scale = minOf(1f, maxSide.toFloat() / maxOf(bmp.width, bmp.height))
                 val pw = maxOf(1, (bmp.width * scale).toInt())
                 val ph = maxOf(1, (bmp.height * scale).toInt())
-                val scaled = if (scale < 1f) Bitmap.createScaledBitmap(bmp, pw, ph, true) else bmp
+                // 纯像素域重采样（不走 Canvas：直通位图上 canvas 在部分 ROM 直接失败）
+                val scaled = if (scale < 1f) PvrConverter.resampleBitmap(bmp, pw, ph) else bmp
                 previewSrc = scaled
                 infoText = fileName + "  " + bmp.width + "x" + bmp.height +
                     (if (scale < 1f) L.s(R.string.x_preview_scaled) else "")

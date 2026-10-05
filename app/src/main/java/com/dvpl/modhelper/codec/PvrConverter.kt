@@ -198,6 +198,75 @@ object PvrConverter {
         return b
     }
 
+    /** mipmap 链降采样（直通 alpha 安全）：纯像素域 2×2 盒式滤波，完全不经 Canvas。
+     *  修复：createScaledBitmap 内部走 Canvas.drawBitmap，直通位图上 canvas 在部分 ROM 上
+     *  直接失败（"canvas: trying to use a non-premultiplied bitmap"）→ PVR/DDS 整批转换挂掉。
+     *  奇数尺寸边缘钳位重复采样，与 Skia 双线性中点采样等价。输出保持直通标记。 */
+    fun halveBitmap(src: Bitmap): Bitmap {
+        val w = src.width; val h = src.height
+        val nw = maxOf(1, (w + 1) / 2); val nh = maxOf(1, (h + 1) / 2)
+        val sp = IntArray(w * h)
+        src.getPixels(sp, 0, w, 0, 0, w, h)
+        val dp = IntArray(nw * nh)
+        for (y in 0 until nh) {
+            val y0 = y * 2; val y1 = minOf(y0 + 1, h - 1)
+            val r0 = y0 * w; val r1 = y1 * w
+            for (x in 0 until nw) {
+                val x0 = x * 2; val x1 = minOf(x0 + 1, w - 1)
+                val p00 = sp[r0 + x0]; val p01 = sp[r0 + x1]
+                val p10 = sp[r1 + x0]; val p11 = sp[r1 + x1]
+                val a = ((p00 ushr 24) + (p01 ushr 24) + (p10 ushr 24) + (p11 ushr 24) + 2) shr 2
+                val r = (((p00 shr 16) and 0xFF) + ((p01 shr 16) and 0xFF) +
+                    ((p10 shr 16) and 0xFF) + ((p11 shr 16) and 0xFF) + 2) shr 2
+                val g = (((p00 shr 8) and 0xFF) + ((p01 shr 8) and 0xFF) +
+                    ((p10 shr 8) and 0xFF) + ((p11 shr 8) and 0xFF) + 2) shr 2
+                val b = ((p00 and 0xFF) + (p01 and 0xFF) + (p10 and 0xFF) + (p11 and 0xFF) + 2) shr 2
+                dp[y * nw + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val out = Bitmap.createBitmap(nw, nh, Bitmap.Config.ARGB_8888)
+        out.isPremultiplied = false   // 源是直通，输出同样保持直通（编码路径无损透传）
+        out.setPixels(dp, 0, nw, 0, 0, nw, nh)
+        return out
+    }
+
+    /** 任意比例降采样（直通安全）：纯像素域双线性，不经 Canvas（同 halveBitmap 的原因）。
+     *  预览缩放用；采样点取目标像素中心对应源坐标，边缘钳位。 */
+    fun resampleBitmap(src: Bitmap, nw: Int, nh: Int): Bitmap {
+        val w = src.width; val h = src.height
+        if (nw == w && nh == h) return src
+        if (nw < 1 || nh < 1) throw IllegalArgumentException("bad target size")
+        val sp = IntArray(w * h)
+        src.getPixels(sp, 0, w, 0, 0, w, h)
+        val dp = IntArray(nw * nh)
+        val sx = w.toFloat() / nw; val sy = h.toFloat() / nh
+        for (y in 0 until nh) {
+            val fy = (y + 0.5f) * sy - 0.5f
+            val y0 = fy.toInt().coerceIn(0, h - 1); val y1 = minOf(y0 + 1, h - 1)
+            val wy = (fy - y0).coerceIn(0f, 1f)
+            val r0 = y0 * w; val r1 = y1 * w
+            for (x in 0 until nw) {
+                val fx = (x + 0.5f) * sx - 0.5f
+                val x0 = fx.toInt().coerceIn(0, w - 1); val x1 = minOf(x0 + 1, w - 1)
+                val wx = (fx - x0).coerceIn(0f, 1f)
+                val p00 = sp[r0 + x0]; val p01 = sp[r0 + x1]; val p10 = sp[r1 + x0]; val p11 = sp[r1 + x1]
+                fun lerp(a: Int, b: Int, t: Float) = (a + (b - a) * t + 0.5f).toInt()
+                val a = lerp(lerp(p00 ushr 24, p01 ushr 24, wx), lerp(p10 ushr 24, p11 ushr 24, wx), wy)
+                val r = lerp(lerp((p00 shr 16) and 0xFF, (p01 shr 16) and 0xFF, wx),
+                    lerp((p10 shr 16) and 0xFF, (p11 shr 16) and 0xFF, wx), wy)
+                val g = lerp(lerp((p00 shr 8) and 0xFF, (p01 shr 8) and 0xFF, wx),
+                    lerp((p10 shr 8) and 0xFF, (p11 shr 8) and 0xFF, wx), wy)
+                val b = lerp(lerp(p00 and 0xFF, p01 and 0xFF, wx),
+                    lerp(p10 and 0xFF, p11 and 0xFF, wx), wy)
+                dp[y * nw + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        val out = Bitmap.createBitmap(nw, nh, Bitmap.Config.ARGB_8888)
+        out.isPremultiplied = false
+        out.setPixels(dp, 0, nw, 0, 0, nw, nh)
+        return out
+    }
+
     /**
      * Bitmap → PVR 文件字节（ASTC 或 RGBA8888/4444，含 mip 链）
      *
@@ -337,15 +406,13 @@ object PvrConverter {
                 }
             }
 
-            // 下一级 mip
+            // 下一级 mip（纯像素域盒式滤波，不走 Canvas——直通位图上 canvas 在部分 ROM 直接失败）
             if (it < mips - 1) {
-                val nextW = maxOf(1, (curW + 1) / 2)
-                val nextH = maxOf(1, (curH + 1) / 2)
-                val scaled = Bitmap.createScaledBitmap(curBitmap, nextW, nextH, true)
+                val scaled = halveBitmap(curBitmap)
                 if (!isFirst) curBitmap.recycle()
                 curBitmap = scaled
                 isFirst = false
-                curW = nextW; curH = nextH
+                curW = scaled.width; curH = scaled.height
             }
         }
         if (!isFirst) curBitmap.recycle()
