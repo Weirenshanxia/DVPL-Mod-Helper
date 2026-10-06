@@ -11,6 +11,8 @@ class WerewolfDiag2Test {
 
     @Test
     fun diag2() {
+        // 样本 zip 为本机测试资产, 不随仓库分发: 不存在时跳过而非报错
+        org.junit.Assume.assumeTrue("样本 zip 不存在（跳过）: " + zip, zip.isFile)
         val zf = ZipFile(zip)
         var sc2: ByteArray? = null
         var scg: ByteArray? = null
@@ -21,8 +23,8 @@ class WerewolfDiag2Test {
         val groups = ScgConverter.parseScg(scg!!)
         ScgConverter.assignLod(groups)
         val ids = groups.map { it.id }.toSet()
-        val names = ScgConverter.parseSc2Names(sc2!!, ids)
-        for (g in groups) g.sc2Name = names[g.id]
+        val info = ScgConverter.parseSc2Info(sc2!!, ids)
+        for (g in groups) { g.family = info.familyOf(g.id); g.sc2Name = info.familyName[g.family] }
 
         val v3 = groups.filter { it.vertexFormat == 3 }
         println("vfmt=3 组数: " + v3.size)

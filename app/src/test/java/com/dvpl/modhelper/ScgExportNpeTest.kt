@@ -53,13 +53,13 @@ class ScgExportNpeTest {
             val groups = ScgConverter.parseScg(
                 ScgConverter.unwrapDvpl(File(root, "USSR/R132_VNII_100LT.scg.dvpl").readBytes())
             ).toMutableList()
-            val names = ScgConverter.parseSc2Names(
+            val info = ScgConverter.parseSc2Info(
                 ScgConverter.unwrapDvpl(File(root, "USSR/R132_VNII_100LT.sc2.dvpl").readBytes()),
                 groups.map { it.id }.toSet()
             )
-            for (g in groups) g.sc2Name = names[g.id]
+            for (g in groups) { g.family = info.familyOf(g.id); g.sc2Name = info.familyName[g.family] }
             ScgConverter.assignLod(groups)
-            ScgConverter.assignNames(groups, null)
+            ScgConverter.assignNames(groups, null, info.vocab)
             // 多选附加件（extraScgs）：id 2_000_000 起，lod=0，name=文件名去后缀
             var idOff = 2_000_000L
             val cust = File(root, "Customization").listFiles()
@@ -96,14 +96,14 @@ class ScgExportNpeTest {
         ).toMutableList()
         check(groups.isNotEmpty()) { "no groups: " + tankName }
 
-        val names = ScgConverter.parseSc2Names(
+        val info = ScgConverter.parseSc2Info(
             ScgConverter.unwrapDvpl(sc2File.readBytes()),
             groups.map { it.id }.toSet()
         )
-        for (g in groups) g.sc2Name = names[g.id]
+        for (g in groups) { g.family = info.familyOf(g.id); g.sc2Name = info.familyName[g.family] }
 
         ScgConverter.assignLod(groups)
-        ScgConverter.assignNames(groups, null)
+        ScgConverter.assignNames(groups, null, info.vocab)
 
         val key = tankName.lowercase().replace(Regex("[^a-z0-9]"), "")
         var skinMerged = 0

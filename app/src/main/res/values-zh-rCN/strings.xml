@@ -458,4 +458,21 @@
     <string name="e_img_decode">图像解码失败（格式不支持或文件损坏）</string>
     <string name="e_video_meta">无法读取视频时长</string>
     <string name="e_video_frames">未能从视频中提取帧</string>
+
+    <!-- UV 查看器 -->
+    <string name="b_uv_viewer">UV 查看器（SCG/OBJ）</string>
+    <string name="uv_wireframe">线框</string>
+    <string name="uv_textured">贴图</string>
+    <string name="uv_overlay">叠加</string>
+    <string name="uv_filter_nearest">像素（NEAREST）</string>
+    <string name="uv_lod0">仅 LOD0</string>
+    <string name="uv_parts">部件</string>
+    <string name="uv_no_uv">无UV</string>
+    <string name="uv_import_all">导入贴图（全部）</string>
+    <string name="uv_import_part">给此部件导入贴图</string>
+    <string name="uv_reset">重置视图</string>
+    <string name="uv_hint">拖动平移 · 双指缩放 0.2-128x · 点部件名自动定位</string>
+    <string name="uv_hint_3d">拖动旋转 · 双指缩放 · 点部件独立显示</string>
+    <string name="e_obj_parse">OBJ 解析失败</string>
+    <string name="e_uv_tex">贴图解码失败</string>
 </resources>

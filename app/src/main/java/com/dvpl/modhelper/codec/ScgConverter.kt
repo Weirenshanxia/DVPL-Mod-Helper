@@ -76,12 +76,99 @@ object ScgConverter {
     private fun uvLayoutFor(g: ScgGroup): Pair<Int, Boolean>? {
         // vfmt=3 的 24B 形态: pos(12) + normal f32×3(12), 无 UV 字节（实测尾三字恒为单位向量）
         if (g.vertexFormat == 3 && g.stride == 24) return null
-        UV_LAYOUT[g.vertexFormat]?.let { return it }
+        // 挂点标记（3 顶点小三角, 同 scgCategory 判定）无 UV 通道, 数据处是杂散字节
+        if (g.vertexCount <= 3) return null
+        // 元数据记录（贴图路径/节点名）顶点位置是 ASCII 字节误读, 量级 ±1e38, 过滤掉
+        if (!posSane(g)) return null
+        val tab = UV_LAYOUT[g.vertexFormat]
+        if (tab != null) return if (uvSane(g, tab)) tab else detectUvLayout(g)
         val cached = uvAutoDetected[g.vertexFormat]
-        if (cached != null) return if (cached === NO_UV) null else cached as Pair<Int, Boolean>
+        if (cached != null) {
+            if (cached === NO_UV) return null
+            val c = cached as Pair<Int, Boolean>
+            return if (uvSane(g, c)) c else detectUvLayout(g)
+        }
         val r = detectUvLayout(g)
         uvAutoDetected[g.vertexFormat] = r ?: NO_UV
         return r
+    }
+
+    /**
+     * 表/缓存布局逐组垃圾校验: >=95% 采样 UV 有限且 |u|,|v| <= 32。
+     * 判"垃圾"用量级而非 0..2 值域: 正常 UV 通道可能合法平铺超出 2（皮肤件）,
+     * 而打包 tangent 等字节误读成 float 是 ±1e38 量级, 量级过滤可精确区分两者。
+     * 校验不过 → 逐组探测兜底（探测按 0..2 值域找真 UV 通道）。
+     */
+    private fun uvSane(g: ScgGroup, uv: Pair<Int, Boolean>): Boolean {
+        val stride = g.stride
+        if (stride < 16 || g.vertexCount < 4) return true
+        val v = g.vertices
+        val need = if (uv.second) 4 else 8
+        if (uv.first + need > stride) return false
+        val n = minOf(g.vertexCount, 64)
+        var ok = 0
+        for (i in 0 until n) {
+            val base = i * stride + uv.first
+            if (base + need > v.size) return false
+            val u = if (uv.second) half(v, base) else f32(v, base)
+            val w = if (uv.second) half(v, base + 2) else f32(v, base + 4)
+            if (u.isFinite() && w.isFinite() && kotlin.math.abs(u) <= 32f &&
+                kotlin.math.abs(w) <= 32f) ok++
+        }
+        return ok >= n * 0.95f
+    }    /**
+     * 检查采样 UV 是否是 ±1e20 级垃圾（贴图路径/节点名字符串误读成 float）。
+     * 仅在 UV_LAYOUT 有条目时调用。真实几何的 UV 极少超出 ±10000，垃圾值是 ±1e38。
+     */
+    private fun uvGarbage(g: ScgGroup, uv: Pair<Int, Boolean>): Boolean {
+        val stride = g.stride
+        val need = if (uv.second) 4 else 8
+        if (uv.first + need > stride || g.vertexCount < 4 || stride < 16) return false
+        val v = g.vertices
+        val n = minOf(g.vertexCount, 64)
+        var bad = 0
+        for (i in 0 until n) {
+            val base = i * stride + uv.first
+            if (base + need > v.size) return false
+            val u = if (uv.second) half(v, base) else f32(v, base)
+            val w = if (uv.second) half(v, base + 2) else f32(v, base + 4)
+            if (!u.isFinite() || !w.isFinite() || kotlin.math.abs(u) > 1e20f || kotlin.math.abs(w) > 1e20f) bad++
+        }
+        return bad >= n / 2
+    }
+
+    /**
+     * 该 record 是否为场景元数据（贴图路径/节点名等字节被误当几何体）而非真实几何。
+     * 判据: 格式表声明应有 UV 却采样到 ±1e20 级垃圾 UV。
+     */
+    internal fun isMetaRecord(g: ScgGroup): Boolean {
+        if (g.vertexCount <= 3) return false
+        val tab = UV_LAYOUT[g.vertexFormat] ?: return false
+        if (!posSane(g)) return true
+        return uvGarbage(g, tab)
+    }
+
+
+
+    /**
+     * 顶点位置合理性校验: 坐克范围 ±1e5m（游戏世界尺度）。
+     * SCG 里混有场景元数据记录（贴图路径、节点名等），其"顶点"字节是 ASCII 字符串误读，
+     * 读成 float 是 ±1e38 量级，与真实坐标 ±100m 相差 6 个数量级，一次采样就能区分。
+     */
+    private fun posSane(g: ScgGroup): Boolean {
+        val stride = g.stride
+        if (stride < 12 || g.vertexCount < 1) return true
+        val v = g.vertices
+        val n = minOf(g.vertexCount, 8)
+        for (i in 0 until n) {
+            val base = i * stride
+            if (base + 12 > v.size) return false
+            val x = f32(v, base); val y = f32(v, base + 4); val z = f32(v, base + 8)
+            if (!x.isFinite() || !y.isFinite() || !z.isFinite() ||
+                kotlin.math.abs(x) > 1e5f || kotlin.math.abs(y) > 1e5f || kotlin.math.abs(z) > 1e5f)
+                return false
+        }
+        return true
     }
 
     /**
@@ -147,9 +234,8 @@ object ScgConverter {
         return if (h and 0x8000 != 0) -m else m
     }
 
-    /** sc2 引用模板里的属性标识（引擎属性字典 ID，逆向确认跨车一致） */
-    private const val HASH_GEO_REF = 0xBDD9B834L   // PolygonGroup 引用
-    private const val HASH_NAME_REF = 0xCD75CF90L  // 材质名引用
+    /** sc2 数据源属性标识（引擎属性字典 ID，逆向确认跨车一致；值 = SCG gid） */
+    private const val HASH_GEO_REF = 0xBDD9B834L
 
     class ScgGroup(
         var id: Long,
@@ -170,6 +256,9 @@ object ScgConverter {
 
         /** LOD 等级：0 = 最高细节 */
         var lod = 0
+
+        /** sc2 组件周期号（parseSc2Info 填充，-1 = 无 sc2/未匹配）。同周期网格 = 同部件多级 LOD */
+        var family: Int = -1
 
         /** 包围盒 [mnX,mnY,mnZ,mxX,mxY,mxZ]，assignLod() 时计算 */
         var bbox: FloatArray? = null
@@ -270,74 +359,146 @@ object ScgConverter {
         return groups
     }
 
-    // ---------- SC2 配件名 ----------
+    // ---------- SC2 信息（词汇表 + LOD 家族） ----------
 
-    /** 在 sc2 字节流中找字符串表（首个 KA\x02\x00 记录） */
-    private fun parseStringTable(sc2: ByteArray): List<String>? {
-        for (i in 0x10 until minOf(0x1000, sc2.size - 8)) {
-            if (!matches(sc2, i, "KA\u0002\u0000")) continue
-            val cnt = u32(sc2, i + 4).toInt()
-            if (cnt <= 0 || cnt >= 5000) continue
-            var p = i + 8
-            val out = ArrayList<String>(cnt)
-            var ok = true
-            for (k in 0 until cnt) {
-                if (p + 2 > sc2.size) { ok = false; break }
-                val len = u16(sc2, p); p += 2
-                if (len > 200 || p + len > sc2.size) { ok = false; break }
-                out.add(String(sc2, p, len, Charsets.UTF_8))
-                p += len
+    /** 真实配件名前缀：hull / turret_01 / gun_01 / chassis_*** */
+    private val VOCAB_NAME = Regex("^(hull|turret_\\d+|gun_\\d+|chassis_)")
+
+    /**
+     * sc2 解析结果。
+     * 注意: 周期名 familyName 与网格的对应被游戏导出器打乱（字母序名字 zip 场景序网格），
+     * 不可当部件名用——只用于挂点 HP_* 兜底。
+     */
+    class Sc2Info(val vocab: Set<String>, private val famOf: Map<Long, Int>, val familyName: Map<Int, String?>) {
+        fun familyOf(gid: Long): Int = famOf[gid] ?: -1
+        val hasFamilies: Boolean get() = famOf.isNotEmpty()
+    }
+
+    /** 在 sc2 中定位字符串表（"##name" 项起的 [u16 len][utf8] 序列），失败返回空表 */
+    private fun parseSc2Strings(sc2: ByteArray): List<String> {
+        for (j in 0 until sc2.size - 8) {
+            if (sc2[j] == 0x06.toByte() && sc2[j + 1] == 0x00.toByte() &&
+                sc2[j + 2] == 0x23.toByte() && sc2[j + 3] == 0x23.toByte() &&
+                sc2[j + 4] == 0x6E.toByte() && sc2[j + 5] == 0x61.toByte()) {
+                var p = j
+                val out = ArrayList<String>()
+                while (p + 2 <= sc2.size) {
+                    val len = u16(sc2, p)
+                    if (len == 0 || p + 2 + len > sc2.size) break
+                    out.add(String(sc2, p + 2, len, Charsets.UTF_8))
+                    p += 2 + len
+                }
+                if (out.size >= 4) return out
             }
-            if (ok) return out
         }
-        return null
+        return emptyList()
     }
 
     /**
-     * 解析 sc2，返回 组ID -> 材质名（配件名）。
-     * 引用模板: [0xBDD9B834][0x0A][u64 gid][0xCD75CF90][0x0A][u64 字符串索引]
+     * 解析 sc2 尾部组件区（4 车 331 组实测验证）：
+     *  - 周期 = 组件名属性(0xBF399D40 t7)之间的区段；周期内全部数据源(0xBDD9B834 t0A,
+     *    值 = SCG gid) 属同一部件的多级 LOD（gid 引用的 AABB 与 SCG 网格包围盒全对齐）。
+     *    例: T-55A 炮塔 3 周期 gid 229/230/231 = LOD0/1/2（vc 1232/673/151）。
+     *  - 词汇表 = 字符串表里的 hull/turret_XX/gun_XX/chassis_*** 真名集合。
+     * 周期名与网格的配对被导出器打乱（炮塔网格挂轮子名、炮管挂履带名，hull/turret/gun
+     * 真名根本不在周期流里），所以周期名只用于挂点 HP_* 兜底，部件名走几何分类+词汇表。
      */
-    fun parseSc2Names(sc2: ByteArray, groupIds: Set<Long>): Map<Long, String> {
-        val strings = parseStringTable(sc2) ?: return emptyMap()
-        val map = HashMap<Long, String>()
-        var i = 4
-        val n = sc2.size - 20
+    fun parseSc2Info(sc2: ByteArray, groupIds: Set<Long>): Sc2Info {
+        val strings = parseSc2Strings(sc2)
+        val vocab = HashSet<String>()
+        for (s in strings) if (VOCAB_NAME.containsMatchIn(s)) vocab.add(s)
+        // 交错事件 [offset, kind(0=名字属性/1=数据源), value] 按偏移排序
+        val events = ArrayList<LongArray>()
+        var i = 0
+        val n = sc2.size - 13
         while (i < n) {
-            if (sc2[i] == 0x0A.toByte() &&
-                u32(sc2, i + 5) == 0L &&
-                u32(sc2, i + 9) == HASH_NAME_REF &&
-                sc2[i + 13] == 0x0A.toByte() &&
-                u32(sc2, i + 18) == 0L &&
-                u32(sc2, i - 4) == HASH_GEO_REF
-            ) {
-                val gid = u32(sc2, i + 1)
-                val strIdx = u32(sc2, i + 14).toInt()
-                if (gid in groupIds && strIdx in strings.indices && gid !in map) {
-                    map[gid] = strings[strIdx]
-                }
+            if (u32(sc2, i) == 0xBF399D40L && sc2[i + 4] == 0x07.toByte()) {
+                events.add(longArrayOf(i.toLong(), 0L, u32(sc2, i + 5)))
+            } else if (u32(sc2, i) == HASH_GEO_REF && sc2[i + 4] == 0x0A.toByte()) {
+                var v = 0L
+                for (k in 0 until 8) v = v or ((sc2[i + 5 + k].toLong() and 0xFF) shl (8 * k))
+                events.add(longArrayOf(i.toLong(), 1L, v))
             }
             i++
         }
-        return map
+        events.sortBy { it[0] }
+        val famOf = HashMap<Long, Int>()
+        val familyName = HashMap<Int, String?>()
+        var fam = -1
+        for (e in events) {
+            if (e[1] == 0L) {
+                fam++
+                val idx = e[2].toInt()
+                familyName[fam] = if (idx in strings.indices) strings[idx] else null
+            } else if (fam >= 0 && e[2] in groupIds && e[2] !in famOf) {
+                famOf[e[2]] = fam
+            }
+        }
+        return Sc2Info(vocab, famOf, familyName)
     }
 
     // ---------- LOD 分级 ----------
 
+    /** 部件家族（同一部件的全部 LOD 级网格）。cycleName = sc2 周期名（被打乱，仅兜底用）。 */
+    class Fam(val list: MutableList<ScgGroup>) {
+        var cycleName: String? = null
+    }
+
     /**
-     * 按包围盒聚类并分级：同一（量化 0.1m）包围盒内，顶点数降序 → LOD 0,1,2...
-     * 相同顶点数 = 同级（不同配件并排，例如 4 门炮）。
+     * LOD 分级（家族内顶点数降序 → LOD 0,1,2...；相同顶点数 = 同级）。
+     * 家族来源两级：sc2 组件周期（权威——同周期网格 = 同部件多级 LOD，
+     * T-55A 炮塔 3 gid 229/230/231 即 LOD0/1/2）；无 sc2 时 AABB 相似聚类兜底。
      */
     fun assignLod(groups: List<ScgGroup>) {
-        val clusters = HashMap<String, MutableList<ScgGroup>>()
+        for (g in groups) g.bbox = computeBbox(g)
+        for (fam in buildFamilies(groups)) rankLod(fam.list)
+    }
+
+    private fun rankLod(list: List<ScgGroup>) {
+        val counts = list.map { it.vertexCount }.distinct().sortedDescending()
+        for (g in list) g.lod = counts.indexOf(g.vertexCount)
+    }
+
+    /** sc2 family 字段优先分组；缺 family 的组按 AABB 相似度聚类兜底 */
+    private fun buildFamilies(groups: List<ScgGroup>): List<Fam> {
+        val out = ArrayList<Fam>()
+        val byFam = HashMap<Int, Fam>()
+        val noFam = ArrayList<ScgGroup>()
         for (g in groups) {
-            g.bbox = computeBbox(g)
-            val key = quantKey(g.bbox!!)
-            clusters.getOrPut(key) { ArrayList() }.add(g)
+            if (g.family >= 0) {
+                val f = byFam.getOrPut(g.family) { Fam(ArrayList()).also { out.add(it) } }
+                f.list.add(g)
+                if (f.cycleName == null) f.cycleName = g.sc2Name
+            } else noFam.add(g)
         }
-        for (list in clusters.values) {
-            val counts = list.map { it.vertexCount }.distinct().sortedDescending()
-            for (g in list) g.lod = counts.indexOf(g.vertexCount)
+        if (noFam.isNotEmpty()) for (cluster in similarityClusters(noFam)) out.add(Fam(cluster))
+        return out
+    }
+
+    /** AABB 相似聚类: 中心距 < 0.3m 且每维尺寸比 >= 0.95 视为同部件的不同 LOD */
+    private fun similarityClusters(list: List<ScgGroup>): List<MutableList<ScgGroup>> {
+        val fams = ArrayList<MutableList<ScgGroup>>()
+        outer@ for (g in list) {
+            val db = g.bbox
+            if (db == null) { fams.add(arrayListOf(g)); continue }
+            for (f in fams) {
+                val rb = f.first().bbox ?: continue
+                val dx = (db[0] + db[3] - rb[0] - rb[3]) / 2f
+                val dy = (db[1] + db[4] - rb[1] - rb[4]) / 2f
+                val dz = (db[2] + db[5] - rb[2] - rb[5]) / 2f
+                if (dx * dx + dy * dy + dz * dz > 0.09f) continue
+                var sim = true
+                for (a in 0..2) {
+                    val s1 = db[a + 3] - db[a]; val s2 = rb[a + 3] - rb[a]
+                    if (s1 < 1e-4f || s2 < 1e-4f || minOf(s1, s2) / maxOf(s1, s2) < 0.95f) {
+                        sim = false; break
+                    }
+                }
+                if (sim) { f.add(g); continue@outer }
+            }
+            fams.add(arrayListOf(g))
         }
+        return fams
     }
 
     private fun computeBbox(g: ScgGroup): FloatArray {
@@ -356,15 +517,6 @@ object ScgConverter {
         return out
     }
 
-    private fun quantKey(b: FloatArray): String {
-        val sb = StringBuilder(48)
-        for (i in 0..2) {
-            if (i > 0) sb.append(';')
-            sb.append("%.1f".format(b[i])).append(',').append("%.1f".format(b[i + 3]))
-        }
-        return sb.toString()
-    }
-
     /** 真实配件名白名单（chassis_/gun_/hull/炮塔/履带/车轮/皮肤/活动装饰/挂点…） */
     private val GOOD_NAME = Regex(
         "^(chassis[_.-]?|gun[_.-]?|turret|hull|track|wheel|skin|decal|ny\\d|hw\\d|pumpkin|ladder|" +
@@ -372,26 +524,219 @@ object ScgConverter {
     )
 
     /**
-     * 统一配件命名（assignLod 之后调用，依赖 bbox）。
+     * 统一配件命名（assignLod 之后调用，依赖 bbox/family）。
      *
-     * sc2 名字映射实测不可靠：cd75 指向的字符串有约一半是引擎字典词/自动名，
-     * 且真名与网格的对应关系存在错位（gun_05 实为车体上装甲、轮子挂 turret 名）。
-     * 因此命名优先级：
-     *   1. 几何强特征（车轮/炮管/阴影体/侧裙/车体/上层结构/炮塔）——唯一可信的真相；
-     *      其中车轮若 sc2 名含 "wheel" 则沿用（Tiger 实测正确，268 全是 Instance 垃圾则自动编号）；
-     *   2. 皮肤/装饰类 sc2 名（skin/ny/hw/decal/cinema…）——装饰件无歧义，直接信；
-     *   3. 白名单 sc2 名（chassis_/gun_/hull/HP_ 等）；
-     *   4. 都没有 = null（UI 显示 #ID）。
-     * 不做同名簇继承——它会放大错乱（轮子继承炮塔名正是用户报告的 bug）。
+     * sc2 尾区实测（4 车 331 组验证）：组件名流按字母序、网格流按场景序，导出器把两者
+     * 按位置 zip 进同一条记录——周期名与网格完全错位（炮塔网格挂轮子名、炮管挂履带名），
+     * hull/turret/gun 真名根本不在周期流里。因此坦克模型（词汇表含 >=2 个轮名）改用
+     * 家族级几何分类 + 词汇表计数匹配：
+     *   hull = 最大居中族（离群特效盒先行剔除）；turret = 高处居中族（vc 降序 → turret_01..）；
+     *   gun = 细长居中族（vc 降序 → gun_01..）；wheel = 贴侧小盒（cy 序 → chassis_wheel_L_01..）；
+     *   side = 贴侧长族（高履带凭 UV 平铺放行），履带/坠毁/侧板按 UV 平铺 + 网格复杂度区分:
+     *   履带纹理反复平铺（跨度 >= 2.5）或无 UV 的长盒 = 履带池；坠毁履带是断成碎块的
+     *   网格——同尺寸下顶点/连通碎块远多于正常履带（Object777 实测: 坠毁 294 顶点/167
+     *   碎块 vs 正常 136/10，用户确认），故坠毁 = 池中顶点最多者，正常履带 = 其余较简单者;
+     *   有 UV 但未平铺的长盒 = 侧板；词汇表轮数缺口 → 合并轮组吸收。
+     * 每类先查字符串表真名词汇表——命中 = 游戏原名（无 ?），未命中 = 几何名（带 ?）。
+     * 挂点标记只信周期名里的 HP_*；其余周期名一律不信（已被打乱）。
+     * 非坦克文件（皮肤/装饰/词汇表缺失）走 assignNamesLegacy 逐组启发式。
      *
-     * 名字后缀 "?" = 纯几何猜测（wheel_L1?/hull?/side_L?/gun_mask?…）；不带 "?" = 可信
-     * 来源（游戏 sc2 原名 / 官方碰撞盒匹配出的 gun_XX、turret_XX / 盒包含判定的 hull、chassis）。
-     *
-     * 官方参数强化（tank != null 时）：用游戏自带的零件碰撞盒（Parameters YAML，运行时
-     * 从已安装游戏读取）+ XML gunPosition 把 gun_barrel?/turret? 升级为该车真实零件名
-     * （gun_01/turret_01…），无名网格按盒包含兜底（hull/chassis/gun_XX/gun_mask?）。
+     * 官方参数强化（tank != null）：officialNames 把 null 名升级为官方碰撞盒匹配名。
      */
-    fun assignNames(groups: List<ScgGroup>, tank: TankParams.Tank? = null) {
+    fun assignNames(groups: List<ScgGroup>, tank: TankParams.Tank? = null, vocab: Set<String> = emptySet()) {
+        if (groups.isEmpty()) return
+        val tankLike = vocab.count { it.startsWith("chassis_wheel_") } >= 2
+        if (!tankLike) {
+            assignNamesLegacy(groups)
+            if (tank != null) officialNames(groups, tank)
+            return
+        }
+        for (g in groups) if (g.bbox == null) g.bbox = computeBbox(g)
+        var halfW = 0.01f; var len = 0.01f
+        for (g in groups) {
+            val b = g.bbox ?: continue
+            val gx = b[3] - b[0]; val gy = b[4] - b[1]; val gz = b[5] - b[2]
+            // 离群防护: 粒子/特效垃圾盒（M4A3E8_BP 雪花粒子 275m、Lightbringer 光环 15.7m 方形）
+            // 不参与车体尺寸估计——否则 halfW/len 被撑爆导致侧族/炮塔分类全灭
+            if (maxOf(gx, gy, gz) > 25f) continue
+            if (gx > 8f && gx > gy * 0.9f) continue
+            halfW = maxOf(halfW, abs(b[0]), abs(b[3]))
+            len = maxOf(len, gy)
+        }
+        val fams = buildFamilies(groups)
+        // 每族几何量（用 LOD0 = 顶点数最多的成员代表）
+        class P(val fam: Fam, val rep: ScgGroup) {
+            val b = rep.bbox!!
+            val sx = b[3] - b[0]; val sy = b[4] - b[1]; val sz = b[5] - b[2]
+            val cx = (b[0] + b[3]) / 2f; val cy = (b[1] + b[4]) / 2f; val cz = (b[2] + b[5]) / 2f
+            val vol = sx * sy * sz
+            val mid = floatArrayOf(sx, sy, sz).sorted()[1]
+            val zMin = b[2]
+            /** LOD0 网格 UV 平铺跨度（履带纹理 >= 2.5；无 UV = null） */
+            val tiles = familyTiles(rep)
+            val sane = maxOf(sx, sy, sz) <= 25f && !(sx > 8f && sx > sy * 0.9f)
+        }
+        val parts = ArrayList<P>()
+        var hull: P? = null
+        for (fam in fams) {
+            val rep = fam.list.maxByOrNull { it.vertexCount } ?: continue
+            val p = P(fam, rep)
+            parts.add(p)
+            if (p.sane && abs(p.cx) < halfW * 0.3f && (hull == null || p.vol > hull!!.vol)) hull = p
+        }
+        val wheelsL = ArrayList<P>(); val wheelsR = ArrayList<P>()
+        val sidesL = ArrayList<P>(); val sidesR = ArrayList<P>()
+        val guns = ArrayList<P>(); val turrets = ArrayList<P>()
+        val classOf = HashMap<Fam, String>()
+        for (p in parts) {
+            val cls = when {
+                p.rep.vertexCount <= 3 || p.mid < 0.12f -> "meta"        // 挂点标记/微型参考物
+                p.zMin < -1.2f -> "shadow"                              // 延伸到地下 = 阴影体
+                // 车轮: 贴侧小盒（1.35m 容纳大负重轮/主动轮；B-1bis 小轮 0.34m 也在内）
+                maxOf(p.sx, p.sy, p.sz) <= 1.35f && abs(p.cx) > halfW * 0.4f &&
+                    p.cz < (hull?.cz ?: 2f) + (hull?.sz ?: 0f) * 0.75f -> "wheel"
+                // 炮管: 细长（中间维 <= 0.7m）+ 居中 + 高于车体中线
+                p.sy >= 2f && p.mid <= 0.7f && abs(p.cx) <= maxOf(0.6f, halfW * 0.4f) &&
+                    p.cz > (hull?.cz ?: 1f) -> "gun"
+                // 侧族: 贴侧长盒（履带/侧裙/坠毁裙板；Werewolf 侧箱高 1.7m；
+                // BDR 1.78 / Mark I 2.33 的高环绕履带凭 UV 平铺特征放行）
+                p.sy >= len * 0.5f && abs(p.cx) > halfW * 0.35f &&
+                    (p.sz <= 1.75f || (p.tiles ?: 0f) >= 2.5f) && p.cz <= 1.6f -> "side"
+                p !== hull && abs(p.cx) < halfW * 0.3f &&
+                    p.cz >= (hull?.cz ?: 1.7f) + (hull?.sz ?: 0f) * 0.45f -> "turret"
+                else -> "other"
+            }
+            classOf[p.fam] = cls
+            when (cls) {
+                "wheel" -> (if (p.cx < 0) wheelsL else wheelsR).add(p)
+                "side" -> (if (p.cx < 0) sidesL else sidesR).add(p)
+                "gun" -> guns.add(p)
+                "turret" -> turrets.add(p)
+            }
+        }
+        // ---- 词汇表命名 ----
+        val has: (String) -> Boolean = { vocab.contains(it) }
+        val famName = HashMap<Fam, String?>()
+        if (hull != null) famName[hull!!.fam] = if (has("hull")) "hull" else "hull?"
+        turrets.sortedByDescending { it.rep.vertexCount }.forEachIndexed { i, p ->
+            val key = "turret_" + "%02d".format(i + 1)
+            famName[p.fam] = when {
+                i == 0 && !has(key) -> "turret?"
+                has(key) -> key
+                else -> key + "?"
+            }
+        }
+        guns.sortedByDescending { it.rep.vertexCount }.forEachIndexed { i, p ->
+            val key = "gun_" + "%02d".format(i + 1)
+            famName[p.fam] = when {
+                i == 0 && !has(key) -> "gun_barrel?"
+                has(key) -> key
+                else -> key + "?"
+            }
+        }
+        // ---- 合并轮组吸收: 词汇表轮数 > 实际分出的轮数 → 缺的轮子并进了一个整组
+        //      （一侧全部轮子合为一组 / 前后端轮簇横跨中线两种形态），先吸收再排侧族名，
+        //      否则高 vc 轮组会挤掉履带名额造成 track/chassis/crash 轮转错位 ----
+        for ((s, wl, sl) in listOf(Triple("L", wheelsL, sidesL), Triple("R", wheelsR, sidesR))) {
+            val vocabW = vocab.count { it.startsWith("chassis_wheel_" + s + "_") }
+            if (vocabW <= wl.size || sl.isEmpty()) continue
+            val maxSy = sl.maxOf { it.sy }
+            val cand = parts.filter { p ->
+                p.fam !in famName && p !== hull && p.sane &&
+                    p.rep.vertexCount > 3 && p.sz <= 1.05f && p.cz <= 1.0f &&
+                    (p.tiles == null || p.tiles!! < 2.5f) &&
+                    // 长条形（一侧轮列合并）或 宽短横跨（前后端轮簇）
+                    ((p.sy >= 1.2f && p.sy < maxSy * 0.85f) || (p.sx >= halfW * 0.8f && p.sy <= 1.5f)) &&
+                    (if (s == "L") p.cx <= 0.3f else p.cx >= -0.3f)
+            }.maxByOrNull { it.rep.vertexCount }
+            if (cand != null) {
+                sl.remove(cand); wl.remove(cand)
+                val centered = abs(cand.cx) < halfW * 0.3f
+                val nm = when {
+                    wl.isEmpty() -> "chassis_wheel_" + (if (centered) "" else s + "_") + "all"
+                    wl.size + 1 <= vocabW -> "chassis_wheel_" + (if (centered) "" else s + "_") + "%02d".format(wl.size + 1)
+                    else -> "chassis_wheel_" + (if (centered) "" else s + "_") + "grp"
+                }
+                famName[cand.fam] = nm + "?"
+            }
+        }
+        // ---- 侧族命名: 履带池 = UV 平铺族（履带纹理沿长度反复平铺，跨度 >= 2.5）+ 无 UV 长盒;
+        //      侧板 = 有 UV 但未平铺的长盒。坠毁履带 = 池中顶点最多者——坠毁网格断成碎块,
+        //      同尺寸下顶点/连通碎块远多于正常履带（Object777 294顶点/167碎块 vs 136/10、
+        //      T-55A 261/143 vs 168/43、BZ_75 656/529 vs 180/55，连通分量并查集实测一致;
+        //      Object777 与合并轮车用户实测确认）; 正常履带 = 池中其余较简单者（优先平铺族） ----
+        for ((s, list) in listOf("L" to sidesL, "R" to sidesR)) {
+            if (list.isEmpty()) continue
+            val tiledOf = { p: P -> (p.tiles ?: 0f) >= 2.5f }
+            val tiled = list.filter { tiledOf(it) }
+            val plates = list.filter { it.tiles != null && !tiledOf(it) }
+            val candidates = if (tiled.isNotEmpty()) list.filter { tiledOf(it) || it.tiles == null } else list.toList()
+            val crash = if (candidates.size >= 2) candidates.maxByOrNull { it.rep.vertexCount } else null
+            val restCand = candidates.filter { it !== crash }
+            val track = restCand.filter { tiledOf(it) }.minByOrNull { it.rep.vertexCount }
+                ?: restCand.minByOrNull { it.rep.vertexCount }
+            val rem = list.filter { it !== track && it !== crash }
+            val chassis = plates.filter { it !== track && it !== crash }.maxByOrNull { it.rep.vertexCount }
+                ?: rem.maxByOrNull { it.rep.vertexCount }
+            if (track != null) {
+                val key = "chassis_track_" + s
+                famName[track.fam] = if (has(key)) key else key + "?"
+            }
+            if (crash != null) {
+                val key = "chassis_track_crash_" + s
+                famName[crash.fam] = if (has(key)) key else key + "?"
+            }
+            if (chassis != null) {
+                val key = "chassis_chassis_" + s
+                famName[chassis.fam] = if (has(key)) key else key + "?"
+            }
+            rem.filter { it !== chassis }.forEachIndexed { i, p ->
+                famName[p.fam] = "side_" + s + (if (i > 0) (i + 1).toString() else "") + "?"
+            }
+        }
+        for ((s, list) in listOf("L" to wheelsL, "R" to wheelsR)) {
+            list.sortedBy { it.cy }.forEachIndexed { i, p ->
+                val key = "chassis_wheel_" + s + "_" + "%02d".format(i + 1)
+                famName[p.fam] = if (has(key)) key else "wheel_" + s + (i + 1) + "?"
+            }
+        }
+        // ---- 未分类族兜底 ----
+        for (p in parts) {
+            if (p.fam in famName) continue
+            val cn = p.fam.cycleName
+            famName[p.fam] = when (classOf[p.fam]) {
+                "meta" -> if (cn != null && cn.uppercase().startsWith("HP_")) cn else null
+                "shadow" -> "shadow?"
+                "other" -> when {
+                    // 挡泥板: 小盒 + 车头/车尾极端位置 + 低位
+                    maxOf(p.sx, p.sy, p.sz) <= 2.2f && abs(p.cy) >= len * 0.35f && p.cz <= 1.4f ->
+                        if (p.cx < 0) "fender_L?" else "fender_R?"
+                    hull != null && abs(p.cx) < halfW * 0.3f && p.vol > hull!!.vol * 0.3f &&
+                        p.cz < hull!!.cz + hull!!.sz * 0.45f -> "hull_top?"
+                    else -> null
+                }
+                else -> classOf[p.fam] + "?"
+            }
+        }
+        for ((fam, nm) in famName) for (g in fam.list) g.name = nm
+        // 官方参数区域匹配（存在时）：null 名网格按官方碰撞盒兜底
+        if (tank != null) officialNames(groups, tank)
+    }
+
+    /**
+     * 网格 UV 平铺跨度: 履带/坠毁履带纹理沿长度方向反复平铺（实测 T-55A 11.0、BZ_75 8.3、
+     * BDR 11.0-12.4 格），侧板/轮子/车体都在 1 格上下。返回 max(跨度U, 跨度V)；无 UV 返回 null。
+     */
+    private fun familyTiles(g: ScgGroup): Float? {
+        if (g.vertexCount <= 3 || isMetaRecord(g)) return null
+        val part = extractUvParts(listOf(g)).firstOrNull() ?: return null
+        if (!part.hasUv || part.uv.isEmpty()) return null
+        val bb = part.bbox
+        return maxOf(bb[2] - bb[0], bb[3] - bb[1])
+    }
+
+    /** 旧版逐组启发式命名（皮肤/装饰/非坦克文件——坦克车型已改走家族几何分类） */
+    private fun assignNamesLegacy(groups: List<ScgGroup>) {
         if (groups.isEmpty()) return
         var halfW = 0f; var len = 0f
         for (g in groups) {
@@ -456,9 +801,6 @@ object ScgConverter {
         }
         num(wheels.filter { (it.bbox!![0] + it.bbox!![3]) / 2 < 0 }, "L")
         num(wheels.filter { (it.bbox!![0] + it.bbox!![3]) / 2 >= 0 }, "R")
-
-        // 官方参数区域匹配（存在时）
-        if (tank != null) officialNames(groups, tank)
     }
 
     /** 点是否在零件盒内（带容差；y/z 加枢轴偏移，x 不加——塔位 x 恒为 0） */
@@ -572,7 +914,7 @@ object ScgConverter {
      * @return OBJ 文本 + 统计
      */
     fun writeObj(groups: List<ScgGroup>, selectedIds: Set<Long>): Result {
-        val kept = groups.filter { it.id in selectedIds && it.stride >= 12 }
+        val kept = groups.filter { it.id in selectedIds && it.stride >= 12 && !isMetaRecord(it) }
         val sb = StringBuilder(1 shl 20)
         sb.append("# WoT Blitz SCG -> OBJ (DvplModHelper)\n")
         sb.append("# groups: ").append(groups.size).append(" -> kept ").append(kept.size).append(" (selected)\n")
@@ -647,5 +989,113 @@ object ScgConverter {
             }
         }
         return data
+    }
+
+    // ---------- UV 查看器数据提取 ----------
+
+    /**
+     * 提取各部件的 UV 三角形汤（屏幕空间，OBJ 惯例 V 向上）。
+     * 游戏 V 向下（原点左上），与 writeObj 相同地翻转 v' = 1 - v，
+     * 因此本应用导出的 OBJ 与 SCG 源在 UV 查看器中显示完全一致。
+     * 无 UV 通道的组（vfmt=3/24B 等）→ hasUv=false，查看器灰显。
+     * 注意: 皮肤件 UV 平铺到 0..2 属正常，不裁剪。
+     */
+    fun extractUvParts(groups: List<ScgGroup>): List<UvPart> {
+        val out = ArrayList<UvPart>(groups.size)
+        for (g in groups) {
+            val stride = g.stride
+            if (isMetaRecord(g)) continue
+            val uv = uvLayoutFor(g)
+            if (uv == null || stride < 12 || g.vertexCount <= 0 || g.indexCount < 3) {
+                out.add(UvPart(g.name, g.lod, FloatArray(0), false, null, g.indexCount / 3))
+                continue
+            }
+            val off = uv.first
+            val isHalf = uv.second
+            // 顶点 UV 数组（屏幕空间）
+            val vu = FloatArray(g.vertexCount)
+            val vv = FloatArray(g.vertexCount)
+            val v = g.vertices
+            for (i in 0 until g.vertexCount) {
+                val o = i * stride + off
+                val rawU = if (isHalf) half(v, o) else f32(v, o)
+                val rawV = if (isHalf) half(v, o + 2) else f32(v, o + 4)
+                vu[i] = rawU
+                vv[i] = 1f - rawV
+            }
+            // 索引 → 三角形汤
+            val idx = g.indices
+            val triN = g.indexCount / 3
+            val soup = FloatArray(triN * 6)
+            var n = 0
+            var i16 = 0
+            var i32 = 0
+            var ok = true
+            for (t in 0 until triN) {
+                val a: Int; val b: Int; val c: Int
+                if (g.indexFormat == 0) {
+                    a = u16(idx, i16); i16 += 2
+                    b = u16(idx, i16); i16 += 2
+                    c = u16(idx, i16); i16 += 2
+                } else {
+                    a = u32(idx, i32).toInt(); i32 += 4
+                    b = u32(idx, i32).toInt(); i32 += 4
+                    c = u32(idx, i32).toInt(); i32 += 4
+                }
+                if (a < 0 || b < 0 || c < 0 || a >= g.vertexCount || b >= g.vertexCount || c >= g.vertexCount) {
+                    ok = false; break
+                }
+                soup[n++] = vu[a]; soup[n++] = vv[a]
+                soup[n++] = vu[b]; soup[n++] = vv[b]
+                soup[n++] = vu[c]; soup[n++] = vv[c]
+            }
+            if (!ok) continue
+            out.add(UvPart(g.name, g.lod, soup.copyOf(n), true, null, g.indexCount / 3))
+        }
+        return out
+    }
+
+    /**
+     * 3D 贴图预览用: 单组的游戏空间 UV 三角形汤（不翻转 V，与 ScgGlView 顶点汤同三角/顶点序）。
+     * 无 UV 通道或索引越界返回 null（ScgGlView 退回纯色渲染）。
+     */
+    fun extractGameUv(g: ScgGroup): FloatArray? {
+        if (!posSane(g)) return null
+        val uv = uvLayoutFor(g) ?: return null
+        val stride = g.stride
+        if (stride < 12 || g.vertexCount <= 0 || g.indexCount < 3) return null
+        val off = uv.first
+        val isHalf = uv.second
+        val v = g.vertices
+        val vu = FloatArray(g.vertexCount)
+        val vv = FloatArray(g.vertexCount)
+        for (i in 0 until g.vertexCount) {
+            val o = i * stride + off
+            vu[i] = if (isHalf) half(v, o) else f32(v, o)
+            vv[i] = if (isHalf) half(v, o + 2) else f32(v, o + 4)
+        }
+        val idx = g.indices
+        val triN = g.indexCount / 3
+        val soup = FloatArray(triN * 6)
+        var n = 0
+        var i16 = 0
+        var i32 = 0
+        for (t in 0 until triN) {
+            val a: Int; val b: Int; val c: Int
+            if (g.indexFormat == 0) {
+                a = u16(idx, i16); i16 += 2
+                b = u16(idx, i16); i16 += 2
+                c = u16(idx, i16); i16 += 2
+            } else {
+                a = u32(idx, i32).toInt(); i32 += 4
+                b = u32(idx, i32).toInt(); i32 += 4
+                c = u32(idx, i32).toInt(); i32 += 4
+            }
+            if (a < 0 || b < 0 || c < 0 || a >= g.vertexCount || b >= g.vertexCount || c >= g.vertexCount) return null
+            soup[n++] = vu[a]; soup[n++] = vv[a]
+            soup[n++] = vu[b]; soup[n++] = vv[b]
+            soup[n++] = vu[c]; soup[n++] = vv[c]
+        }
+        return soup
     }
 }

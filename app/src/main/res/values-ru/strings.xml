@@ -458,4 +458,21 @@
     <string name="e_img_decode">Не удалось декодировать изображение (формат не поддерживается или файл повреждён)</string>
     <string name="e_video_meta">Не удалось прочитать длительность видео</string>
     <string name="e_video_frames">Не удалось извлечь кадры из видео</string>
+
+    <!-- UV 查看器 -->
+    <string name="b_uv_viewer">UV-просмотр (SCG/OBJ)</string>
+    <string name="uv_wireframe">Каркас</string>
+    <string name="uv_textured">Текстура</string>
+    <string name="uv_overlay">Наложение</string>
+    <string name="uv_filter_nearest">Пиксели (NEAREST)</string>
+    <string name="uv_lod0">Только LOD0</string>
+    <string name="uv_parts">Детали</string>
+    <string name="uv_no_uv">Без UV</string>
+    <string name="uv_import_all">Текстура (все)</string>
+    <string name="uv_import_part">Текстура для этой детали</string>
+    <string name="uv_reset">Сброс вида</string>
+    <string name="uv_hint">Перетаскивание - щипок 0.2-128x - нажмите деталь для позиционирования</string>
+    <string name="uv_hint_3d">Поворот перетаскиванием - щипок для масштаба - нажмите деталь для показа</string>
+    <string name="e_obj_parse">Ошибка разбора OBJ</string>
+    <string name="e_uv_tex">Не удалось декодировать текстуру</string>
 </resources>

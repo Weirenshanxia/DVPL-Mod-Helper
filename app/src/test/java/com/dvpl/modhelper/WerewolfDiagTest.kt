@@ -11,6 +11,8 @@ class WerewolfDiagTest {
 
     @Test
     fun diag() {
+        // 样本 zip 为本机测试资产, 不随仓库分发: 不存在时跳过而非报错
+        org.junit.Assume.assumeTrue("样本 zip 不存在（跳过）: " + zip, zip.isFile)
         val stridesField = ScgConverter::class.java.getDeclaredField("STRIDES")
         stridesField.isAccessible = true
         @Suppress("UNCHECKED_CAST")

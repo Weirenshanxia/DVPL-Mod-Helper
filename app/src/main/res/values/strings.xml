@@ -458,4 +458,21 @@
     <string name="e_img_decode">Image decode failed (unsupported format or corrupted)</string>
     <string name="e_video_meta">Cannot read video duration</string>
     <string name="e_video_frames">No frames extracted from video</string>
+
+    <!-- UV 查看器 -->
+    <string name="b_uv_viewer">UV viewer (SCG/OBJ)</string>
+    <string name="uv_wireframe">Wireframe</string>
+    <string name="uv_textured">Textured</string>
+    <string name="uv_overlay">Overlay</string>
+    <string name="uv_filter_nearest">Pixel (NEAREST)</string>
+    <string name="uv_lod0">LOD0 only</string>
+    <string name="uv_parts">Parts</string>
+    <string name="uv_no_uv">No UV</string>
+    <string name="uv_import_all">Import texture (all)</string>
+    <string name="uv_import_part">Import texture for this part</string>
+    <string name="uv_reset">Reset view</string>
+    <string name="uv_hint">Drag to pan - pinch 0.2-128x - tap a part to zoom to it</string>
+    <string name="uv_hint_3d">Drag to rotate - pinch to zoom - tap a part to solo it</string>
+    <string name="e_obj_parse">OBJ parse failed</string>
+    <string name="e_uv_tex">Texture decode failed</string>
 </resources>

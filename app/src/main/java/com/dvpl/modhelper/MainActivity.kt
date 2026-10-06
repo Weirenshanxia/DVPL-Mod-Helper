@@ -49,6 +49,7 @@ import com.dvpl.modhelper.BuildConfig
 import com.dvpl.modhelper.codec.DvplCodec
 import com.dvpl.modhelper.ui.PbrEditorScreen
 import com.dvpl.modhelper.ui.TexturePreviewScreen
+import com.dvpl.modhelper.ui.UvViewerScreen
 import com.dvpl.modhelper.ui.WemPlayerScreen
 import com.dvpl.modhelper.codec.PvrConverter
 import com.dvpl.modhelper.codec.ScgConverter
@@ -292,6 +293,15 @@ fun MainScreen() {
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let { pbrEditFile = Pair(it, queryFileName(context, it)) }
+    }
+
+    // ===== UV 查看器（SCG/OBJ → Blender 风格 UV 图; 多选: scg+sc2+涂装附件） =====
+    var uvFiles by remember { mutableStateOf<List<Pair<Uri, String>>?>(null) }
+    val uvLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty())
+            uvFiles = uris.map { Pair(it, queryFileName(context, it)) }
     }
 
     // Wwise 按模板打包：先选库文件（走 multipleFilesLauncher），processFiles 拦截后再调这里选文件夹
@@ -1185,6 +1195,15 @@ fun MainScreen() {
         )
     }
 
+    // UV 查看器屏
+    if (uvFiles != null) {
+        UvViewerScreen(
+            files = uvFiles!!,
+            onBack = { uvFiles = null }
+        )
+        return
+    }
+
     if (previewFile != null) {
         val (uri, name) = previewFile!!
         TexturePreviewScreen(
@@ -1391,6 +1410,13 @@ fun MainScreen() {
                         text = L.s(R.string.b_scg_obj),
                         icon = Icons.Default.ViewInAr,
                         onClick = { launchPicker(ConvertMode.SCG_TO_OBJ) },
+                        enabled = !isProcessing
+                    )
+
+                    FunctionButton(
+                        text = L.s(R.string.b_uv_viewer),
+                        icon = Icons.Default.GridView,
+                        onClick = { uvLauncher.launch(arrayOf("*/*")) },
                         enabled = !isProcessing
                     )
                 }
@@ -1697,8 +1723,9 @@ suspend fun parseScgForDialog(context: Context, scgUri: Uri, sc2Uri: Uri?, fileN
     }
     if (groups.isEmpty()) throw IllegalArgumentException(L.s(R.string.e_scg_parse))
 
-    // 配件名（材质名）：显式选择的 sc2 优先，否则自动找同级
+    // sc2：LOD 家族 + 真名词汇表（显式选择的 sc2 优先，否则自动找同级）
     var namesFound = false
+    var sc2Vocab: Set<String> = emptySet()
     val sc2Bytes = sc2Uri?.let { u ->
         context.contentResolver.openInputStream(u)?.use { it.readBytes() }
     } ?: findSiblingSc2(context, scgUri, fileName)?.let { u ->
@@ -1707,17 +1734,22 @@ suspend fun parseScgForDialog(context: Context, scgUri: Uri, sc2Uri: Uri?, fileN
     if (sc2Bytes != null) {
         try {
             val sc2Data = ScgConverter.unwrapDvpl(sc2Bytes)
-            val names = ScgConverter.parseSc2Names(sc2Data, groups.map { it.id }.toSet())
-            for (g in groups) g.sc2Name = names[g.id]
-            namesFound = names.isNotEmpty()
-        } catch (e: Exception) { /* 名字缺失不致命，退回 #ID */ }
+            val info = ScgConverter.parseSc2Info(sc2Data, groups.map { it.id }.toSet())
+            for (g in groups) {
+                g.family = info.familyOf(g.id)
+                // 周期名与网格的配对被导出器打乱，仅挂点 HP_* 兜底用，不作部件名
+                g.sc2Name = info.familyName[g.family]
+            }
+            sc2Vocab = info.vocab
+            namesFound = info.hasFamilies
+        } catch (e: Exception) { /* sc2 缺失不致命，退回几何命名 */ }
     }
 
     // LOD 分级（同包围盒按顶点数降序）+ 统一命名（几何分类 > 皮肤/装饰名 > 白名单名）
     // 官方参数（从已安装游戏读取的零件碰撞盒）用于真名强化，缺失时几何命名兜底
     val tankParams = try { TankParams.forTank(context, fileName) } catch (e: Exception) { null }
     ScgConverter.assignLod(groups)
-    try { ScgConverter.assignNames(groups, tankParams) } catch (e: Exception) {
+    try { ScgConverter.assignNames(groups, tankParams, sc2Vocab) } catch (e: Exception) {
         // 官方参数命名异常时不阻断导出, 保留已完成的部分命名
         android.util.Log.w("TankParams", "assignNames failed: " + e.message)
     }
@@ -1735,11 +1767,13 @@ suspend fun parseScgForDialog(context: Context, scgUri: Uri, sc2Uri: Uri?, fileN
                 val raw = context.contentResolver.openInputStream(skinUri)?.use { it.readBytes() } ?: continue
                 val sg = try { ScgConverter.parseScg(ScgConverter.unwrapDvpl(raw)) } catch (e: Exception) { continue }
                 if (sg.isEmpty()) continue
+                // 皮肤件内部自带多级 LOD（实测 164/179 个外挂件含 AABB 相似簇），按簇分级，
+                // 不再一律压成 lod0——否则高 LOD 网格会和 lod0 一起被全量导出/选中
+                ScgConverter.assignLod(sg)
                 val tag = skinName.removeSuffix(".dvpl").removeSuffix(".scg")
                 var piece = 0
                 for (g in sg) {
                     g.id = idOff++
-                    g.lod = 0
                     g.name = tag + (if (sg.size > 1) "_#" + ++piece else "")
                 }
                 groups.addAll(sg)
@@ -1756,11 +1790,12 @@ suspend fun parseScgForDialog(context: Context, scgUri: Uri, sc2Uri: Uri?, fileN
         val raw = try { context.contentResolver.openInputStream(exUri)?.use { it.readBytes() } } catch (e: Exception) { null } ?: continue
         val sg = try { ScgConverter.parseScg(ScgConverter.unwrapDvpl(raw)) } catch (e: Exception) { continue }
         if (sg.isEmpty()) continue
+        // 附加件同样按内部 AABB 相似簇分级 LOD
+        ScgConverter.assignLod(sg)
         val tag = exName.removeSuffix(".dvpl").removeSuffix(".scg")
         var piece = 0
         for (g in sg) {
             g.id = idOff++
-            g.lod = 0
             g.name = tag + (if (sg.size > 1) "_#" + ++piece else "")
         }
         groups.addAll(sg)
