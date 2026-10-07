@@ -463,9 +463,9 @@
     <string name="b_uv_viewer">UV viewer (SCG/OBJ)</string>
     <string name="uv_wireframe">Wireframe</string>
     <string name="uv_textured">Textured</string>
-    <string name="uv_overlay">Overlay</string>
-    <string name="uv_filter_nearest">Pixel (NEAREST)</string>
-    <string name="uv_lod0">LOD0 only</string>
+    <string name="uv_overlay">Wireframe overlay</string>
+    <string name="uv_filter_nearest">Pixel-perfect (no blur)</string>
+    <string name="uv_lod0">Highest detail only</string>
     <string name="uv_parts">Parts</string>
     <string name="uv_no_uv">No UV</string>
     <string name="uv_import_all">Import texture (all)</string>
@@ -475,4 +475,9 @@
     <string name="uv_hint_3d">Drag to rotate - pinch to zoom - tap a part to solo it</string>
     <string name="e_obj_parse">OBJ parse failed</string>
     <string name="e_uv_tex">Texture decode failed</string>
+    <string name="uv_export_tex">Export texture region</string>
+    <string name="uv_export_sel">Export texture regions</string>
+    <string name="x_saved">Exported: %1$s</string>
+    <string name="x_saved_batch">Exported %1$d texture regions</string>
+    <string name="e_no_tex_parts">No visible parts with an active texture - import a texture first</string>
 </resources>

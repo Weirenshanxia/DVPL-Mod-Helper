@@ -463,9 +463,9 @@
     <string name="b_uv_viewer">UV 查看器（SCG/OBJ）</string>
     <string name="uv_wireframe">线框</string>
     <string name="uv_textured">贴图</string>
-    <string name="uv_overlay">叠加</string>
-    <string name="uv_filter_nearest">像素（NEAREST）</string>
-    <string name="uv_lod0">仅 LOD0</string>
+    <string name="uv_overlay">线框叠加</string>
+    <string name="uv_filter_nearest">不平滑（原像素）</string>
+    <string name="uv_lod0">仅最高精度</string>
     <string name="uv_parts">部件</string>
     <string name="uv_no_uv">无UV</string>
     <string name="uv_import_all">导入贴图（全部）</string>
@@ -475,4 +475,9 @@
     <string name="uv_hint_3d">拖动旋转 · 双指缩放 · 点部件独立显示</string>
     <string name="e_obj_parse">OBJ 解析失败</string>
     <string name="e_uv_tex">贴图解码失败</string>
+    <string name="uv_export_tex">导出部件贴图区域</string>
+    <string name="uv_export_sel">导出贴图区域</string>
+    <string name="x_saved">已导出：%1$s</string>
+    <string name="x_saved_batch">已导出 %1$d 个贴图区域</string>
+    <string name="e_no_tex_parts">可见部件中还没有生效贴图，请先导入贴图</string>
 </resources>

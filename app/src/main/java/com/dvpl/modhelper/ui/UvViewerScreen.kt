@@ -1,9 +1,11 @@
 package com.dvpl.modhelper.ui
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.view.View
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -16,6 +18,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CenterFocusWeak
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -27,8 +30,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.dvpl.modhelper.L
+import com.dvpl.modhelper.Prefs
 import com.dvpl.modhelper.R
 import com.dvpl.modhelper.ScgGlView
+import com.dvpl.modhelper.saveToDir
+import com.dvpl.modhelper.saveToDownloads
 import com.dvpl.modhelper.codec.DdsConverter
 import com.dvpl.modhelper.codec.DvplCodec
 import com.dvpl.modhelper.codec.ObjReader
@@ -344,6 +350,25 @@ fun UvViewerScreen(files: List<Pair<Uri, String>>, onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.weight(1f))
+            // 批量导出: 勾选 ∩ LOD0 过滤后的部件贴图区域, 每部件一个 PNG
+            TextButton(onClick = {
+                val snap = texMap.toMap()
+                val vis = effVisible
+                scope.launch {
+                    try {
+                        val n = withContext(Dispatchers.IO) {
+                            exportVisibleTextures(context, parts, vis, snap)
+                        }
+                        val msg = if (n > 0) L.s(R.string.x_saved_batch, n)
+                        else L.s(R.string.e_no_tex_parts)
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                    } catch (e: Exception) {
+                        texError = e.message ?: L.s(R.string.e_uv_tex)
+                    }
+                }
+            }) {
+                Text(L.s(R.string.uv_export_sel), style = MaterialTheme.typography.labelMedium)
+            }
             TextButton(onClick = { hidden = emptySet() }) {
                 Text(L.s(R.string.scg_sel_all), style = MaterialTheme.typography.labelMedium)
             }
@@ -394,9 +419,178 @@ fun UvViewerScreen(files: List<Pair<Uri, String>>, onBack: () -> Unit) {
                                 contentDescription = L.s(R.string.uv_import_part),
                                 modifier = Modifier.size(18.dp))
                         }
+                        // 导出该部件贴图区域（生效贴图 = 本部件导入的, 否则全局的）
+                        val effectiveTex = texMap[i] ?: texMap[null]
+                        if (effectiveTex != null) {
+                            IconButton(onClick = {
+                                scope.launch {
+                                    try {
+                                        val saved = withContext(Dispatchers.IO) {
+                                            exportPartTexture(context, p, i, effectiveTex)
+                                        }
+                                        Toast.makeText(context,
+                                            L.s(R.string.x_saved, saved), Toast.LENGTH_SHORT).show()
+                                    } catch (e: Exception) {
+                                        texError = e.message ?: L.s(R.string.e_uv_tex)
+                                    }
+                                }
+                            }) {
+                                Icon(Icons.Default.Save,
+                                    contentDescription = L.s(R.string.uv_export_tex),
+                                    modifier = Modifier.size(18.dp))
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+/** 导出文件名: 部件名清洗 + 部件下标（部件名可能重复） */
+private fun exportTexName(part: UvPart, idx: Int): String {
+    val safe = (part.name ?: "part").replace(Regex("[^A-Za-z0-9_.]"), "_")
+        .trim('_').take(48).ifEmpty { "part" }
+    return safe + "_" + idx + ".png"
+}
+
+/**
+ * UV 三角形汤 → 覆盖纹素掩码: 边函数光栅化（像素中心, 在边上也算覆盖）。
+ * V 向上、位图行 0 在上 → y = (1-v)*h。
+ *
+ * 平铺（履带等 UV 越界反复平铺）按 REPEAT 语义折回主 [0,1] 块, 但只能按
+ * 三角形整体平移 + 写入时取模环绕, 不能逐顶点 fract: u/v 正好落在整数边界
+ * (1.0 极常见——贴图岛边缘) 时 fract 会把它折成 0, 贴边/跨块的三角形直接
+ * 被拉变形（顶边覆盖跑到底边去）。
+ */
+internal fun rasterizeMask(uv: FloatArray, w: Int, h: Int): ByteArray {
+    val mask = ByteArray(w * h)
+    val n = uv.size / 6
+    for (t in 0 until n) {
+        val o = t * 6
+        val au = uv[o]; val av = uv[o + 1]
+        val bu = uv[o + 2]; val bv = uv[o + 3]
+        val cu = uv[o + 4]; val cv = uv[o + 5]
+        // 整体平移到主块起点（保形）, 越界部分靠写入取模环绕落回主块
+        val su = kotlin.math.floor(kotlin.math.min(au, kotlin.math.min(bu, cu)))
+        val sv = kotlin.math.floor(kotlin.math.min(av, kotlin.math.min(bv, cv)))
+        var x0 = (au - su) * w; var y0 = (1f - (av - sv)) * h
+        var x1 = (bu - su) * w; var y1 = (1f - (bv - sv)) * h
+        var x2 = (cu - su) * w; var y2 = (1f - (cv - sv)) * h
+        // 统一绕向; 有向面积 0 = 退化三角形, 跳过
+        val a2 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if (a2 == 0f) continue
+        if (a2 < 0f) { val tx = x1; x1 = x2; x2 = tx; val ty = y1; y1 = y2; y2 = ty }
+        // 三角形像素 bbox（±1 余量; 不夹到图内, 环绕由写入取模完成）
+        val minX = kotlin.math.floor(kotlin.math.min(x0, kotlin.math.min(x1, x2))).toInt() - 1
+        val maxX = kotlin.math.ceil(kotlin.math.max(x0, kotlin.math.max(x1, x2))).toInt() + 1
+        val minY = kotlin.math.floor(kotlin.math.min(y0, kotlin.math.min(y1, y2))).toInt() - 1
+        val maxY = kotlin.math.ceil(kotlin.math.max(y0, kotlin.math.max(y1, y2))).toInt() + 1
+        // 垃圾 UV 防护: 单个三角形扫描面积超过贴图 64 倍直接跳过
+        if ((maxX - minX + 1).toLong() * (maxY - minY + 1) > 64L * w * h) continue
+        for (py in minY..maxY) {
+            val pcy = py + 0.5f
+            val row = Math.floorMod(py, h) * w
+            var xx = Math.floorMod(minX, w)
+            var px = minX
+            while (px <= maxX) {
+                val pcx = px + 0.5f
+                if ((x1 - x0) * (pcy - y0) - (y1 - y0) * (pcx - x0) >= 0f &&
+                    (x2 - x1) * (pcy - y1) - (y2 - y1) * (pcx - x1) >= 0f &&
+                    (x0 - x2) * (pcy - y2) - (y0 - y2) * (pcx - x2) >= 0f
+                ) mask[row + xx] = 1
+                px++
+                xx++; if (xx == w) xx = 0
+            }
+        }
+    }
+    return mask
+}
+
+/** 3×3 膨胀（水平/垂直两趟分离实现）: 像素中心判定会漏细边缘纹素, 补一圈 */
+private fun dilateMask(mask: ByteArray, w: Int, h: Int) {
+    val tmp = ByteArray(w * h)
+    for (y in 0 until h) {
+        val row = y * w
+        for (x in 0 until w) {
+            if (mask[row + x] != 0.toByte()) {
+                tmp[row + x] = 1
+                if (x > 0) tmp[row + x - 1] = 1
+                if (x < w - 1) tmp[row + x + 1] = 1
+            }
+        }
+    }
+    for (y in 0 until h) {
+        val row = y * w
+        for (x in 0 until w) {
+            if (tmp[row + x] != 0.toByte()) {
+                mask[row + x] = 1
+                if (y > 0) mask[row - w + x] = 1
+                if (y < h - 1) mask[row + w + x] = 1
+            }
+        }
+    }
+}
+
+/**
+ * 部件贴图（保持原图分辨率与原位）: 与源贴图同尺寸, 仅 UV 覆盖的纹素保留
+ * 原图像素, 其余一律透明。导出的 PNG 可在图像编辑器里与原图像素级对位叠加。
+ * 纯像素域 getPixels/setPixels——不走 Canvas（直通 alpha 位图在部分 ROM 上
+ * 会抛 "canvas: trying to use a non-premultiplied bitmap", 同
+ * PvrConverter.resampleBitmap 注释里的坑）。
+ */
+private fun maskedFullBitmap(bmp: Bitmap, uv: FloatArray): Bitmap {
+    val w = bmp.width; val h = bmp.height
+    val mask = rasterizeMask(uv, w, h)
+    dilateMask(mask, w, h)
+    val px = IntArray(w * h)
+    bmp.getPixels(px, 0, w, 0, 0, w, h)
+    for (i in px.indices) if (mask[i] == 0.toByte()) px[i] = 0   // 全透明
+    val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    out.isPremultiplied = bmp.isPremultiplied   // 保持直通/预乘属性, PNG 编码按属性换算
+    out.setPixels(px, 0, w, 0, 0, w, h)
+    return out
+}
+
+/**
+ * 导出部件贴图 PNG（原位透明版, 同原图分辨率）。
+ * 保存到用户设置的导出目录, 未设置则公共下载目录。
+ */
+private fun exportPartTexture(context: Context, part: UvPart, idx: Int, bmp: Bitmap): String {
+    val bytes = java.io.ByteArrayOutputStream().use { o ->
+        maskedFullBitmap(bmp, part.uv).compress(Bitmap.CompressFormat.PNG, 100, o); o.toByteArray()
+    }
+    val dirUri = Prefs.getOutputDirUri(context)
+    val outName = exportTexName(part, idx)
+    return if (dirUri != null) saveToDir(context, dirUri, outName, bytes)
+    else saveToDownloads(context, outName, bytes, null)
+}
+
+/**
+ * 批量导出当前显示部件的贴图（勾选 ∩ LOD0 过滤 = 2D 视图正显示着的部件）。
+ * 每个部件一个同分辨率原位 PNG（部件名_下标.png, 重名自动加序号）。
+ * @return 导出个数
+ */
+private fun exportVisibleTextures(
+    context: Context,
+    parts: List<UvPart>,
+    vis: Set<Int>?,
+    texMap: Map<Int?, Bitmap>
+): Int {
+    val dirUri = Prefs.getOutputDirUri(context)
+    var n = 0
+    for (i in parts.indices) {
+        if (vis != null && i !in vis) continue
+        val p = parts[i]
+        if (!p.hasUv || p.uv.isEmpty()) continue
+        val bmp = texMap[i] ?: texMap[null] ?: continue
+        val bytes = java.io.ByteArrayOutputStream().use { o ->
+            maskedFullBitmap(bmp, p.uv).compress(Bitmap.CompressFormat.PNG, 100, o); o.toByteArray()
+        }
+        val outName = exportTexName(p, i)
+        if (dirUri != null) saveToDir(context, dirUri, outName, bytes)
+        else saveToDownloads(context, outName, bytes, null)
+        n++
+    }
+    return n
 }
