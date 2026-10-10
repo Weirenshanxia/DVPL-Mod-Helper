@@ -26,10 +26,10 @@ jobs:
       run: chmod +x gradlew
     
     - name: Build with Gradle
-      run: ./gradlew assembleRelease --no-daemon
+      run: ./gradlew assembleStableRelease --no-daemon
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: app-release-unsigned
-        path: app/build/outputs/apk/release/*.apk
+        name: app-stable-release-unsigned
+        path: app/build/outputs/apk/stable/release/*.apk
