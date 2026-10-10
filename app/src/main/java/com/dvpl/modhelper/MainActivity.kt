@@ -48,6 +48,7 @@ import com.dvpl.modhelper.codec.DdsConverter
 import com.dvpl.modhelper.BuildConfig
 import com.dvpl.modhelper.codec.DvplCodec
 import com.dvpl.modhelper.ui.PbrEditorScreen
+import com.dvpl.modhelper.ui.SpriteEditorScreen
 import com.dvpl.modhelper.ui.TexturePreviewScreen
 import com.dvpl.modhelper.ui.UvViewerScreen
 import com.dvpl.modhelper.ui.WemPlayerScreen
@@ -303,6 +304,18 @@ fun MainScreen() {
         if (uris.isNotEmpty())
             uvFiles = uris.map { Pair(it, queryFileName(context, it)) }
     }
+
+    // ===== 精灵图编辑器（Gfx txt + 图集一起多选导入） =====
+    var spriteEditFiles by remember { mutableStateOf<List<Pair<Uri, String>>?>(null) }
+    val spriteEditLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty())
+            spriteEditFiles = uris.map { Pair(it, queryFileName(context, it)) }
+    }
+
+    // ===== SC2 场景编辑器
+    Sc2Feature.RegisterLauncher(context, queryFileName = { queryFileName(context, it) })
 
     // Wwise 按模板打包：先选库文件（走 multipleFilesLauncher），processFiles 拦截后再调这里选文件夹
     val sourceFolderLauncher = rememberLauncherForActivityResult(
@@ -1226,6 +1239,19 @@ fun MainScreen() {
         return
     }
 
+    // 精灵图编辑屏（Gfx txt + 图集多选）
+    if (spriteEditFiles != null) {
+        SpriteEditorScreen(
+            files = spriteEditFiles!!,
+            outputDirUri = outputDirUri,
+            onBack = { spriteEditFiles = null }
+        )
+        return
+    }
+
+    // SC2 场景编辑屏
+    if (Sc2Feature.MaybeScreen(outputDirUri)) return
+
     // WEM 试听屏（多文件列表）
     if (wemPlayFiles.isNotEmpty()) {
         WemPlayerScreen(
@@ -1404,6 +1430,16 @@ fun MainScreen() {
                     )
                 }
 
+                // ===== 精灵图编辑（texture0+txt） =====
+                SectionCard(title = L.s(R.string.sec_texture_txt)) {
+                    FunctionButton(
+                        text = L.s(R.string.b_sprite_editor),
+                        icon = Icons.Default.Crop,
+                        onClick = { spriteEditLauncher.launch(arrayOf("*/*")) },
+                        enabled = !isProcessing
+                    )
+                }
+
                 // ===== 3D 模型（SCG -> OBJ，含 LOD 筛选） =====
                 SectionCard(title = L.s(R.string.sec_3d)) {
                     FunctionButton(
@@ -1419,6 +1455,8 @@ fun MainScreen() {
                         onClick = { uvLauncher.launch(arrayOf("*/*")) },
                         enabled = !isProcessing
                     )
+
+                    Sc2Feature.Button(isProcessing)
                 }
 
                 // ===== WebP 通用转换（图像/视频混批，标准格式、体积小） =====

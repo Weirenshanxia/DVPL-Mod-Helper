@@ -49,6 +49,18 @@ android {
         abortOnError = false
     }
     
+    flavorDimensions += "tier"
+    productFlavors {
+        create("stable") {
+            dimension = "tier"
+        }
+        create("dev") {
+            dimension = "tier"
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true

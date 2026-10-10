@@ -33,3 +33,9 @@ captures/
 obj/
 libs/
 .vscode/c_cpp_properties.json
+/docs/
+# DEV
+app/src/main/java/com/dvpl/modhelper/codec/ScgDocument.kt
+app/src/dev/
+app/src/testDev/
+app/src/test/

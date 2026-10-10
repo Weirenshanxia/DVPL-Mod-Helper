@@ -203,8 +203,11 @@ fun PbrEditorScreen(
 
             val shown = if (showOriginal) previewSrc else previewOut
             shown?.let {
+                // Compose 硬件 Canvas 要求预乘位图; 直通 alpha(inPremultiplied=false) 直接
+                // 传入会崩溃("canvas: trying to use a non-premultiplied bitmap")。
+                // 这里只转显示用副本，导出路径重算像素、不用此副本。
                 Image(
-                    bitmap = it.asImageBitmap(),
+                    bitmap = it.asPremultipliedImageBitmap(),
                     contentDescription = L.s(R.string.b_preview),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -445,4 +448,36 @@ private fun exportFullRes(
     } finally {
         bmp.recycle()
     }
+}
+
+/**
+ * 返回一个适合传给 Compose [asImageBitmap] 的预乘副本。
+ * Compose 硬件加速 Canvas 要求位图是预乘的；直通 alpha(inPremultiplied=false) 会崩溃。
+ * 若本身已是预乘则直接返回自身（无额外分配）。
+ */
+private fun android.graphics.Bitmap.asPremultipliedImageBitmap(): androidx.compose.ui.graphics.ImageBitmap {
+    if (isPremultiplied) return asImageBitmap()
+    // getPixels 返回直通 ARGB int；createBitmap 默认 isPremultiplied=true，
+    // setPixels 会按位图的预乘标志做转换——但这里我们直接复制原始 int 值
+    // 再把新位图标为直通，然后 copy(isPremultiplied=true) 触发真正的预乘转换。
+    // 最简方式：copy(config, isMutable=false) 带 isPremultiplied 标志变换。
+    // Android Bitmap.copy 不接受 isPremultiplied 参数；用 canvas 绘制会崩。
+    // 最安全路径：getPixels → premultiply in IntArray → createBitmap (premul=true)。
+    val w = width; val h = height
+    val px = IntArray(w * h)
+    getPixels(px, 0, w, 0, 0, w, h)
+    // 手动预乘: R' = R*A/255, G' = G*A/255, B' = B*A/255, A'=A
+    for (i in px.indices) {
+        val c = px[i]
+        val a = (c ushr 24) and 0xFF
+        if (a == 255 || a == 0) continue        // 全不透明/全透明无需计算
+        val r = ((c ushr 16 and 0xFF) * a + 127) / 255
+        val g = ((c ushr  8 and 0xFF) * a + 127) / 255
+        val b = ((c        and 0xFF) * a + 127) / 255
+        px[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+    }
+    val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+    // isPremultiplied 默认 true; setPixels 收到已预乘的 int 数据正好匹配
+    out.setPixels(px, 0, w, 0, 0, w, h)
+    return out.asImageBitmap()
 }

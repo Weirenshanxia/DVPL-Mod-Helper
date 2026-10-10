@@ -10,8 +10,8 @@ import kotlin.math.abs
  * - 记录流: "KA\x01\x00" + u32 pairCount + N 个属性对
  *   属性对 = 名称(type4: [4][u32 len][utf8]) + 值(type2: [2][u32] / type4: [4][u32 len][utf8] / type6: [6][u32 len][bytes])
  * - 每辆车 = 若干 PolygonGroup：整车全部可研发配件、全部 LOD、挂点标记都在同一个文件里
- * - 顶点: 位置恒为 float3 @ +0/+4/+8（米制，Z 向上），法线 @ +12..+20；步长由 vertexFormat 决定：
- *   3=16B(简化) 395=56B 399=60B 411=64B(蒙皮)；未知格式回退 stride = size / vertexCount
+ * - 顶点: 位置恒为 float3 @ +0/+4/+8（米制，Z 向上），法线 @ +12..+20；步长由 vertexFormat 决定。
+ *   未知格式回退 stride = size / vertexCount
  * - 索引: u16 (indexFormat=0) / u32，三角列表
  *
  * 配件名（材质名）来自同名 .sc2 场景文件：
@@ -34,21 +34,22 @@ object ScgConverter {
 
     /**
      * UV 通道位置: vertexFormat -> (顶点内偏移, 是否半精度float2)。
-     * 实测采样验证（采样值域+变化数判定）:
-     * - 布局A: pos@+0(12B) normal@+12(12B) uv float2@+24 —— 11/395/399/411/507/907
-     *   (411 为修正: 原 half@24 推断有误, 实测 float@24, 另有 uv1@28/uv2@32 附加通道)
-     * - 布局B: pos@+0(12B) normal@+12(12B) tangent@+24(4B打包) uv float2@+28 —— 911/511/1023/495xx
-     * - 3 = 16B: pos@+0 + uv half2@+12（布局推断）。
+     * - 395/411/507: uv0@+24; 399/415: uv0@+28（+24 是 4B 顶点色槽, 误读会得到假 UV）
+     * - 实测采样验证（采样值域+变化数判定）:
+     * - 布局A: pos@+0(12B) normal@+12(12B) uv float2@+24 —— 11/395/411/507/907
+     * - 布局B: pos@+0(12B) normal@+12(12B) uv float2@+28 —— 399/415/911/511/1023/495xx
+     *   (399 修正: 原 @24 是 RGBA8 标记槽 99% 全 0, 真 uv0 在 @28——31 车逐顶点 cross/tex 相关性实测)
+     * - 3 = 16B: pos@+0 + f32@+12（标记组, 无 UV）。
      * 注意: 皮肤件 UV 常平铺到 0..2 (u 最大到 1.995)，属正常现象。
      */
     private val UV_LAYOUT = mapOf(
         11 to Pair(24, false),
         395 to Pair(24, false),
-        399 to Pair(24, false),
-        411 to Pair(24, false),   // 修正: 实测 float@24（原推断 half@24 错误）
-        507 to Pair(24, false),
+        399 to Pair(28, false),   // uv0 @28
+        411 to Pair(24, false),   // uv1@32 (tex=2)
+        507 to Pair(24, false),   // uv1@32 uv2@40 uv3@48 (tex=4)
         511 to Pair(28, false),
-        907 to Pair(24, false),   // 395 + 0x200 (蒙皮权重附加通道), stride 60, UV 同 395 @+24 float
+        907 to Pair(24, false),   // 395 + 0x200 (硬蒙皮关节槽 4B), stride 60, UV 同 395 @+24 float
         911 to Pair(28, false),   // 399 + 0x200, tangent 打包 @+24, UV @+28 float
         923 to Pair(28, false),   // 411 + 0x200, 多用于炮塔皮肤件
         415 to Pair(28, false),   // 411 + 0x4 (tangent), Type5 Exp 等皮肤件实测
